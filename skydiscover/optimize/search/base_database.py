@@ -8,7 +8,6 @@ needed for program database operations.
 from __future__ import annotations
 
 import logging
-import os
 import random
 import time
 from abc import ABC, abstractmethod
@@ -16,6 +15,7 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from skydiscover.optimize.config import DatabaseConfig
+from skydiscover.optimize.search.persistence.operations import database_operation
 from skydiscover.optimize.utils.metrics import compute_proxy_score, format_metrics, get_score
 from skydiscover.optimize.utils.pareto import nondominated_items, objective_vector
 
@@ -83,47 +83,80 @@ class ProgramDatabase(ABC):
     - Sample a program and context programs to learn from past experiences for the next discovery step
     """
 
+    durable = False
+    run_id: Optional[str] = None
+    language: str
+    last_iteration: int
+    initial_program_id: Optional[str]
+    initial_program_score: Optional[float]
+    best_program_id: Optional[str]
+    programs: Dict[str, Program]
+    rng: random.Random
+    prompts_by_program: Optional[Dict[str, Dict[str, Any]]]
+    _pareto_front_cache: Optional[List[Program]]
+    _pareto_front_cache_valid: bool
+
+    @property
+    def next_iteration(self) -> int:
+        return self.last_iteration + 1
+
     def __init__(self, name: str, config: DatabaseConfig, **kwargs: Any):
         self.name = name
         self.config = config
 
-        # In-memory program storage
-        # Per-database RNG. Seeding the module-global `random` would reach every
-        # other component in the process; this keeps selection reproducible without
-        # that side effect. random.Random(None) draws from OS entropy, so an unset
-        # seed behaves exactly as before.
-        self.rng: random.Random = random.Random(getattr(config, "random_seed", None))
+    @abstractmethod
+    def get(self, program_id: str) -> Optional[Program]:
+        """Fetch a candidate by ID."""
+        ...
 
-        self.programs: Dict[str, Program] = {}
-        # Set by Runner from the resolved config; subclasses read it when
-        # rendering prompts and naming saved program files.
-        self.language: str = "python"
+    @abstractmethod
+    def count(self) -> int:
+        """Number of active candidates."""
+        ...
 
-        # Track the last iteration number (for resuming)
-        self.last_iteration: int = 0
+    def has_programs(self) -> bool:
+        return self.count() > 0
 
-        # Optionally track initial program info (set by controller on first add)
-        self.initial_program_id: Optional[str] = None
-        self.initial_program_score: Optional[float] = None
+    def iter_programs(self):
+        return iter(self.programs.values())
 
-        # Best program tracking
-        self.best_program_id: Optional[str] = None
+    @database_operation
+    def update(self, program: Program) -> None:
+        """Persist edits without applying algorithm admission a second time."""
+        self.programs[program.id] = program
+        self._invalidate_pareto_cache()
 
-        # Lazy Pareto-front cache (invalidated on add when multiobjective)
-        self._pareto_front_cache: Optional[List[Program]] = None
-        self._pareto_front_cache_valid: bool = False
+    def operation(self):
+        from contextlib import nullcontext
 
-        # Prompt log
-        self.prompts_by_program: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None
+        return nullcontext()
 
-        # Initialize checkpoint manager (imported here to avoid circular imports)
-        from skydiscover.optimize.search.utils.checkpoint_manager import CheckpointManager
+    def sample_for_iteration(self, iteration: int, num_context_programs=4, **kwargs):
+        return self.sample(num_context_programs, **kwargs)
 
-        self.checkpoint_manager = CheckpointManager(self.config)
+    def is_iteration_complete(self, iteration: int) -> bool:
+        return False
 
-        # Load database from disk if path is provided
-        if config.db_path and os.path.exists(config.db_path):
-            self.load(config.db_path)
+    def complete_iteration(self, iteration: int, controller_state=None, error=None, outcome=None):
+        self.last_iteration = max(self.last_iteration, iteration)
+
+    def get_controller_state(self):
+        return {}
+
+    def save_controller_state(self, state):
+        pass
+
+    def save(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def load(self, path):
+        raise NotImplementedError
+
+    def _save_program(self, program, base_path=None, prompts=None):
+        pass
+
+    def close(self):
+        pass
 
     # ------------------------------------------------------------------
     # Abstract methods — implement these in subclasses
@@ -166,67 +199,6 @@ class ProgramDatabase(ABC):
         ...
 
     # ------------------------------------------------------------------
-    # Save and load
-    # ------------------------------------------------------------------
-    def save(
-        self,
-        path: Optional[str] = None,
-        iteration: int = 0,
-        programs: Optional[Dict[str, Program]] = None,
-    ) -> None:
-        """
-        Save the database to disk
-
-        Args:
-            path: Path to save to (uses config.db_path if None)
-            iteration: Current iteration number
-            programs: Snapshot to write instead of ``self.programs``. Subclasses
-                pass one when the checkpoint should hold something other than the
-                live registry; saving must never mutate in-memory state.
-        """
-        self.checkpoint_manager.save(
-            programs=self.programs if programs is None else programs,
-            prompts_by_program=self.prompts_by_program,
-            best_program_id=self.best_program_id,
-            last_iteration=iteration if iteration is not None else self.last_iteration,
-            path=path,
-        )
-
-    def load(self, path: str) -> None:
-        """
-        Load the database from disk
-
-        Args:
-            path: Path to load from
-        """
-        programs, best_id, last_iter = self.checkpoint_manager.load(path)
-        self.programs = programs
-        self.best_program_id = best_id
-        self.last_iteration = last_iter
-
-        self.log_status()
-
-    def _save_program(
-        self,
-        program: Program,
-        base_path: Optional[str] = None,
-        prompts: Optional[Dict[str, Dict[str, str]]] = None,
-    ) -> None:
-        """
-        Save a single program to disk.
-
-        This is a convenience method that delegates to CheckpointManager.
-        Subclasses should use this method when they need to save individual programs
-        (e.g., during add() operations).
-
-        Args:
-            program: Program to save
-            base_path: Base path to save to (uses config.db_path if None)
-            prompts: Optional prompts to save with the program
-        """
-        self.checkpoint_manager._save_program(program, base_path, prompts)
-
-    # ------------------------------------------------------------------
     # Best program tracking
     # ------------------------------------------------------------------
 
@@ -252,6 +224,7 @@ class ProgramDatabase(ABC):
         self._pareto_front_cache_valid = False
         self._pareto_front_cache = None
 
+    @database_operation
     def get_pareto_front(self) -> List[Program]:
         """Return the global non-dominated front (lazy-cached).
 
@@ -298,7 +271,7 @@ class ProgramDatabase(ABC):
             return self._proxy_score(program1) > self._proxy_score(program2)
         return get_score(program1.metrics) > get_score(program2.metrics)
 
-    def _update_best_program(self, program: Program) -> None:
+    def _update_best_program(self, program: Program) -> Optional[bool]:
         """Update the best program tracking after a new program is added."""
         self._invalidate_pareto_cache()
 
@@ -326,6 +299,7 @@ class ProgramDatabase(ABC):
         if self._is_better(program, current_best):
             self.best_program_id = program.id
 
+    @database_operation
     def get_best_program(self, metric: Optional[str] = None) -> Optional[Program]:
         """Get the best program, optionally by a specific metric."""
         if not self.programs:
@@ -373,6 +347,7 @@ class ProgramDatabase(ABC):
 
         return sorted_programs[0] if sorted_programs else None
 
+    @database_operation
     def get_top_programs(self, n: int = 10, metric: Optional[str] = None) -> List[Program]:
         """Get the top N programs, optionally by a specific metric."""
         if not self.programs:
@@ -405,13 +380,10 @@ class ProgramDatabase(ABC):
 
         return sorted_programs[:n]
 
-    def get(self, program_id: str) -> Optional[Program]:
-        """Get a program by ID"""
-        return self.programs.get(program_id)
-
     # ------------------------------------------------------------------
     # Prompt logging
     # ------------------------------------------------------------------
+    @database_operation
     def log_prompt(
         self,
         program_id: str,
@@ -444,6 +416,7 @@ class ProgramDatabase(ABC):
             self.prompts_by_program[program_id] = {}
         self.prompts_by_program[program_id][template_key] = prompt
 
+    @database_operation
     def log_status(self) -> None:
         """Log the status of the database"""
         best_program = self.get_best_program()
@@ -455,6 +428,7 @@ class ProgramDatabase(ABC):
             f"Database has {len(self.programs)} programs, best program score is {score_str}"
         )
 
+    @database_operation
     def get_statistics(
         self, num_recent_iterations: int = 100, k: int = 20, improvement_threshold: float = 0.10
     ) -> Dict[str, Any]:

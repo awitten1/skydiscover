@@ -52,6 +52,67 @@ class CoEvolutionController(DiscoveryController):
 
         self._init_search_evolution_controller()
         self._init_output_dir(controller_input)
+        if self.database.durable and not self.database.get_controller_state():
+            self.database.save_controller_state(self.get_run_state())
+
+    _DURABLE_FIELDS = (
+        "_active_search_algorithm_code",
+        "_fallback_search_code",
+        "_best_search_score",
+        "_num_search_evolutions",
+        "_switch_interval",
+        "_stagnant_count",
+        "_meta_evolution_failures",
+        "_last_tracked_best_score",
+        "_diverge_label",
+        "_refine_label",
+        "start_db_stats",
+    )
+
+    def get_run_state(self):
+        from dataclasses import asdict
+
+        state = super().get_run_state()
+        state.update({k: getattr(self, k) for k in self._DURABLE_FIELDS if hasattr(self, k)})
+        state["search_scorer"] = vars(self.search_scorer).copy()
+        state["pending_search_result"] = (
+            asdict(self._pending_search_result) if self._pending_search_result else None
+        )
+        state["fallback_revision"] = getattr(self._fallback_database, "_revision", None)
+        state["meta_run_id"] = self.search_controller.database.run_id
+        return state
+
+    def restore_run_state(self, state):
+        super().restore_run_state(state)
+        if not state:
+            return
+        for key in self._DURABLE_FIELDS:
+            if key in state:
+                setattr(self, key, state[key])
+        self.search_scorer.__dict__.update(state.get("search_scorer", {}))
+        pending = state.get("pending_search_result")
+        self._pending_search_result = SerializableResult(**pending) if pending else None
+        revision = state.get("fallback_revision")
+        if self.database.durable and revision is not None and self._fallback_search_code:
+            with tempfile.TemporaryDirectory(prefix="skydiscover-fallback-") as directory:
+                path = os.path.join(directory, "strategy.py")
+                with open(path, "w") as f:
+                    f.write(self._fallback_search_code)
+                cls, program_cls = load_database_from_file(path, backend="postgres")
+                self._fallback_database = cls(
+                    self.config.search.type, self.database.strategy_config(revision)
+                )
+                self._fallback_database._program_class = program_cls
+                self._fallback_database._open()
+        self._assign_labels_to_db(self.database)
+        self._wrap_add_method(self.database)
+
+    def close(self):
+        try:
+            self.search_controller.close()
+            self.search_controller.database.close()
+        finally:
+            super().close()
 
     def _init_search_evolution_controller(self) -> None:
         """Initialize search controller, scorer, and load initial algorithm."""
@@ -61,6 +122,14 @@ class CoEvolutionController(DiscoveryController):
                 "config.search.database.database_file_path is required for co-evolution"
             )
 
+        saved = self.database.get_controller_state() if self.database.durable else {}
+        database_overrides = None
+        if self.database.durable:
+            database_overrides = {
+                "backend": "postgres",
+                "postgres_dsn": db_cfg.postgres_dsn,
+                "run_id": saved.get("meta_run_id"),
+            }
         controller_input, self._search_initial_code = setup_search(
             initial_program_path=db_cfg.database_file_path,
             evaluation_file=db_cfg.evaluation_file,
@@ -68,6 +137,7 @@ class CoEvolutionController(DiscoveryController):
             output_dir=self.config.search.output_dir,
             evaluator_env_vars=self.evaluator_env_vars,
             parent_llm_config=self.config.llm if self.config.search.share_llm else None,
+            database_overrides=database_overrides,
         )
         self.search_controller = DiscoveryController(controller_input)
         self.search_scorer = LogWindowScorer()
@@ -165,18 +235,22 @@ class CoEvolutionController(DiscoveryController):
             self._switch_interval = max(1, int(max_iterations * self.DEFAULT_SWITCH_RATIO))
             logger.debug(f"Switch if {self._switch_interval} iterations of stagnation detected")
 
-        self.start_db_stats = self.database.get_statistics(
-            improvement_threshold=self.DEFAULT_IMPROVEMENT_THRESHOLD
-        )
+        if not hasattr(self, "start_db_stats"):
+            self.start_db_stats = self.database.get_statistics(
+                improvement_threshold=self.DEFAULT_IMPROVEMENT_THRESHOLD
+            )
 
         # Check meta-search LLM availability before starting
         await self._check_meta_llm_availability()
 
         # Set up search window and labels
-        self._reset_search_window()
+        if self.search_scorer.get_start_score() is None:
+            self._reset_search_window()
 
         # Generate variation labels for the search algorithm
-        await self._generate_variation_operators()
+        if not self._diverge_label and not self._refine_label:
+            await self._generate_variation_operators()
+        self.database.save_controller_state(self.get_run_state())
 
         # Run co-evolution
         iteration = start_iteration
@@ -185,6 +259,9 @@ class CoEvolutionController(DiscoveryController):
                 logger.info("Shutdown requested")
                 break
 
+            if self.database.is_iteration_complete(iteration):
+                iteration += 1
+                continue
             try:
                 # Run solution iteration
                 result = await self._run_iteration(iteration, retry_times=3)
@@ -198,14 +275,15 @@ class CoEvolutionController(DiscoveryController):
                     if self._fallback_database is not None and result.prompt is None:
                         self._restore_fallback_database()
                         continue  # Retry same iteration with restored database
-                else:
-                    self._process_iteration_result(result, iteration, checkpoint_callback)
-
-                for _ in range(attempts_used):
-                    self._record_search_window_step()
-
-                completed_solution_iter = iteration
-                iteration += attempts_used
+                with self.database.operation():
+                    if not result.error:
+                        self._process_iteration_result(result, iteration, checkpoint_callback)
+                    for _ in range(attempts_used):
+                        self._record_search_window_step()
+                    completed_solution_iter = iteration
+                    for offset in range(attempts_used):
+                        self._complete_iteration(iteration + offset, result.error, result)
+                    iteration += attempts_used
 
                 # Co-evolve search strategy if needed (skip on final iteration)
                 if iteration < self.total_solution_iterations and self._should_evolve_search():
@@ -229,6 +307,7 @@ class CoEvolutionController(DiscoveryController):
                             exc_info=True,
                         )
                         self._meta_evolution_failures += 1
+                self.database.save_controller_state(self.get_run_state())
 
             except Exception as e:
                 logger.error(f"Error in iteration {iteration}: {e}", exc_info=True)
@@ -240,6 +319,7 @@ class CoEvolutionController(DiscoveryController):
 
         if self._pending_search_result:
             await self._finalize_pending_search()
+            self.database.save_controller_state(self.get_run_state())
 
         logger.info(f"[SOLUTION EVOLUTION] Evolution completed: {self.database.name}")
         if self._meta_evolution_failures:
@@ -340,8 +420,9 @@ class CoEvolutionController(DiscoveryController):
             initial_result, self._num_search_evolutions, verbose=False
         )
 
-        self.search_controller.database.initial_program_id = initial_program.id
-        self.search_controller.database.initial_program_score = search_score
+        with self.search_controller.database.operation():
+            self.search_controller.database.initial_program_id = initial_program.id
+            self.search_controller.database.initial_program_score = search_score
         self._num_search_evolutions += 1
 
         self._reset_search_window()
@@ -447,7 +528,7 @@ class CoEvolutionController(DiscoveryController):
             refine_label=self._refine_label,
         )
 
-        if not self._switch_to_new_search_algorithm(result):
+        if not self._switch_to_new_search_algorithm(result, solution_iter):
             await handle_generation_failure(
                 self.search_outputs_dir,
                 self._active_search_algorithm_code,
@@ -479,7 +560,9 @@ class CoEvolutionController(DiscoveryController):
             ),
         }
 
-    def _switch_to_new_search_algorithm(self, result: SerializableResult) -> bool:
+    def _switch_to_new_search_algorithm(
+        self, result: SerializableResult, solution_iter=None
+    ) -> bool:
         """Switch solution database to use the new search algorithm."""
         child_dict = result.child_program_dict or {}
         search_code = child_dict.get("solution")
@@ -487,6 +570,10 @@ class CoEvolutionController(DiscoveryController):
             logger.warning("No solution in search result; skipping transition")
             return False
 
+        original_db = self.database
+        original_fallback = self._fallback_database
+        original_fallback_code = self._fallback_search_code
+        original_code = self._active_search_algorithm_code
         search_program_id = child_dict.get("id", "unknown")
         fd, file_path = tempfile.mkstemp(suffix=".py", prefix="evox_search_")
         try:
@@ -494,14 +581,24 @@ class CoEvolutionController(DiscoveryController):
                 f.write(search_code)
 
             # Load the new search algorithm database
-            new_db_class, prog_class = load_database_from_file(file_path)
+            new_db_class, prog_class = load_database_from_file(
+                file_path, backend=self.config.search.database.backend
+            )
             # Ensure labels exist for databases that use them in __init__ (before _assign_labels_to_db)
             if not hasattr(new_db_class, "DIVERGE_LABEL"):
                 new_db_class.DIVERGE_LABEL = ""
             if not hasattr(new_db_class, "REFINE_LABEL"):
                 new_db_class.REFINE_LABEL = ""
-            new_db = new_db_class(self.config.search.type, self.config.search.database)
+            db_config = (
+                self.database.strategy_config()
+                if self.database.durable
+                else self.config.search.database
+            )
+            new_db = new_db_class(self.config.search.type, db_config)
             new_db._program_class = prog_class
+            if self.database.durable:
+                new_db._open()
+                new_db.set_strategy_source(search_code)
 
             # Assign labels to the new search algorithm database
             self._assign_labels_to_db(new_db)
@@ -523,9 +620,21 @@ class CoEvolutionController(DiscoveryController):
             )
 
             self._active_search_algorithm_code = search_code
+            if self.database.durable:
+                with self.database.operation():
+                    self._pending_search_result = result
+                    self._reset_search_window(start_iteration=solution_iter)
+                    self.database.activate_strategy()
+                    self.database.save_controller_state(self.get_run_state())
             return True
 
         except Exception as e:
+            self.database = original_db
+            self._fallback_database = original_fallback
+            self._fallback_search_code = original_fallback_code
+            self._active_search_algorithm_code = original_code
+            if self.evaluator.llm_judge:
+                self.evaluator.llm_judge.database = original_db
             logger.error(f"Failed to load search algorithm {search_program_id}: {e}")
             return False
         finally:
@@ -560,6 +669,10 @@ class CoEvolutionController(DiscoveryController):
         self._num_search_evolutions += 1  # Count the failed attempt
         self._fallback_database = None
         self._fallback_search_code = None
+        if self.database.durable:
+            with self.database.operation():
+                self.database.activate_strategy()
+                self.database.save_controller_state(self.get_run_state())
 
     def _migrate_to_db(self, new_db) -> int:
         """Migrate all programs and prompts from current database to new database."""
@@ -570,7 +683,7 @@ class CoEvolutionController(DiscoveryController):
         migrated = len(self.database.programs)
 
         # Migrate prompts
-        if self.database.config.log_prompts:
+        if self.database.config.log_prompts and not self.database.durable:
             if new_db.prompts_by_program is None:
                 new_db.prompts_by_program = {}
 
@@ -631,9 +744,10 @@ class CoEvolutionController(DiscoveryController):
         original_add = db.add
 
         def wrapped_add(program, iteration=None, **kwargs):
-            result = original_add(program, iteration=iteration, **kwargs)
-            db._update_best_program(program)  # Idempotent safety for LLM-generated databases
-            return result
+            with db.operation():
+                result = original_add(program, iteration=iteration, **kwargs)
+                db._update_best_program(program)
+                return result
 
         db.add = wrapped_add
 

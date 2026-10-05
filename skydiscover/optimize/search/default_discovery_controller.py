@@ -116,6 +116,23 @@ class DiscoveryController:
             f"DiscoveryController initialized: num_context_programs={self.num_context_programs}"
         )
 
+    def get_run_state(self):
+        return {"early_stopping_triggered": self.early_stopping_triggered}
+
+    def restore_run_state(self, state):
+        if state:
+            self.early_stopping_triggered = state.get("early_stopping_triggered", False)
+
+    def _complete_iteration(self, iteration, error=None, result=None):
+        from dataclasses import asdict
+
+        self.database.complete_iteration(
+            iteration,
+            self.get_run_state(),
+            error=error,
+            outcome=asdict(result) if result is not None and self.database.durable else None,
+        )
+
     def close(self):
         """Release resources held by the evaluator (e.g. Docker containers)."""
         if hasattr(self.evaluator, "close"):
@@ -251,10 +268,14 @@ class DiscoveryController:
                 logger.info("Shutdown requested, stopping discovery loop early")
                 break
 
+            if self.database.is_iteration_complete(iteration):
+                continue
             try:
                 result = await self._run_iteration(iteration, retry_times=retry_times)
                 if result.error:
                     logger.warning(f"Iteration {iteration} failed: {result.error}")
+                    if post_process_result:
+                        self._complete_iteration(iteration, result.error, result)
                     continue
 
                 if post_process_result:
@@ -299,7 +320,7 @@ class DiscoveryController:
             state as soon as the ``await`` inside ``_run_iteration`` yields.
             """
             async with sem:
-                if self.shutdown_event.is_set():
+                if self.shutdown_event.is_set() or self.database.is_iteration_complete(iteration):
                     return iteration, None
                 try:
                     result = await self._run_iteration(iteration, retry_times=retry_times)
@@ -312,6 +333,8 @@ class DiscoveryController:
             if result and not result.error and post_process_result:
                 self._process_iteration_result(result, iteration, checkpoint_callback)
             elif result and result.error:
+                if post_process_result:
+                    self._complete_iteration(iteration, result.error, result)
                 logger.warning(f"Iteration {iteration} failed: {result.error}")
 
             return iteration, result
@@ -448,11 +471,11 @@ class DiscoveryController:
     ) -> SerializableResult:
         """Run a single generate-evaluate iteration."""
         try:
-            if not self.database.programs:
+            if not self.database.has_programs():
                 return await self._run_from_scratch_iteration(iteration)
 
-            raw_parent, raw_context_programs = self.database.sample(
-                num_context_programs=self.num_context_programs
+            raw_parent, raw_context_programs = self.database.sample_for_iteration(
+                iteration, num_context_programs=self.num_context_programs
             )
 
             # Normalize sample() result — databases may return plain or dict-wrapped
@@ -911,7 +934,16 @@ class DiscoveryController:
         logger.info("Graceful shutdown requested...")
         self.shutdown_event.set()
 
-    def _process_iteration_result(
+    def _process_iteration_result(self, result, iteration, checkpoint_callback=None, verbose=True):
+        with self.database.operation():
+            if type(self) is DiscoveryController and self.database.is_iteration_complete(iteration):
+                return
+            self._process_iteration_result_impl(result, iteration, checkpoint_callback, verbose)
+            # GEPA and EvoX commit their extra controller state at their own loop boundary.
+            if type(self) is DiscoveryController:
+                self._complete_iteration(iteration, result.error, result)
+
+    def _process_iteration_result_impl(
         self,
         result: Any,
         iteration: int,

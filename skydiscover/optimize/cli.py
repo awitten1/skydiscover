@@ -74,6 +74,7 @@ def parse_args(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> 
         default=None,
         help="Path to a checkpoint directory to resume from",
     )
+    parser.add_argument("--resume", help="Resume a PostgreSQL run by its run ID")
     parser.add_argument("--api-base", default=None, help="Base URL for the LLM API")
     parser.add_argument(
         "--agentic",
@@ -209,6 +210,10 @@ async def main_async(argv: Optional[List[str]] = None, prog: Optional[str] = Non
 
             # External backends (openevolve, shinkaevolve, gepa)
             if is_external(search_type):
+                if config.search.database.backend == "postgres" or args.resume:
+                    raise ValueError(
+                        "PostgreSQL run storage and resume are supported by native Optimize algorithms only"
+                    )
                 if evaluator_env_vars:
                     env_var_names = ", ".join(sorted(evaluator_env_vars))
                     print(
@@ -272,6 +277,7 @@ async def main_async(argv: Optional[List[str]] = None, prog: Optional[str] = Non
             config_path=args.config if config is None else None,
             output_dir=args.output,
             evaluator_env_vars=evaluator_env_vars,
+            resume=args.resume,
         )
 
         # Load the checkpoint if provided
@@ -299,7 +305,10 @@ async def main_async(argv: Optional[List[str]] = None, prog: Optional[str] = Non
                 formatted = f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
                 print(f"  {name}: {formatted}")
 
-        if latest_checkpoint:
+        if runner.run_id:
+            print(f"\nRun ID: {runner.run_id}")
+            print(f"To resume: --resume {runner.run_id}")
+        if latest_checkpoint and not runner.run_id:
             print(f"\nLatest checkpoint: {latest_checkpoint}")
             print(f"To resume: --checkpoint {latest_checkpoint}")
 

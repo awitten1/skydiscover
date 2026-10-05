@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from skydiscover.optimize.config import DatabaseConfig
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.in_memory_database import InMemoryProgramDatabase
+from skydiscover.optimize.search.persistence.operations import database_operation
 from skydiscover.optimize.search.utils.checkpoint_manager import SafeJSONEncoder
 from skydiscover.optimize.utils.metrics import get_score
 
@@ -32,7 +34,7 @@ from .pareto_utils import select_program_candidate_from_pareto_front
 logger = logging.getLogger(__name__)
 
 
-class GEPANativeDatabase(ProgramDatabase):
+class GEPANativeDatabaseMethods(ProgramDatabase):
     """
     Program database for GEPA Native search.
 
@@ -72,6 +74,7 @@ class GEPANativeDatabase(ProgramDatabase):
     # Core interface
     # ------------------------------------------------------------------
 
+    @database_operation
     def add(self, program: Program, iteration: Optional[int] = None, **kwargs: Any) -> str:
         """Add a program to the database and elite pool.
 
@@ -137,6 +140,7 @@ class GEPANativeDatabase(ProgramDatabase):
         )
         return program.id
 
+    @database_operation
     def sample(
         self,
         num_context_programs: Optional[int] = 4,
@@ -164,6 +168,7 @@ class GEPANativeDatabase(ProgramDatabase):
     # GEPA-specific methods
     # ------------------------------------------------------------------
 
+    @database_operation
     def add_rejected(self, program: Program) -> None:
         """Store a rejected program for reflective prompting.
 
@@ -171,6 +176,7 @@ class GEPANativeDatabase(ProgramDatabase):
         """
         self.rejection_history.append(program)
 
+    @database_operation
     def get_rejection_history(self, limit: Optional[int] = None) -> List[Program]:
         """Return recent rejected programs, most-recent last.
 
@@ -182,6 +188,7 @@ class GEPANativeDatabase(ProgramDatabase):
             items = items[-limit:]
         return items
 
+    @database_operation
     def get_merge_candidates(self) -> Tuple[Program, Program]:
         """Select two complementary programs for LLM-mediated merge.
 
@@ -370,3 +377,13 @@ class GEPANativeDatabase(ProgramDatabase):
             seen.add(pid)
 
         return other_context_programs[:num_context_programs]
+
+
+class InMemoryGEPANativeProgramDatabase(GEPANativeDatabaseMethods, InMemoryProgramDatabase):
+    """GEPANative selection with in-memory storage."""
+
+    pass
+
+
+# Preserve the existing import path.
+GEPANativeDatabase = InMemoryGEPANativeProgramDatabase

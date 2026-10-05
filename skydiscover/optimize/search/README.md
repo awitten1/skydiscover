@@ -19,9 +19,10 @@ There are two levels of customization:
 Subclass `ProgramDatabase` and implement two methods. The default controller runs the loop unchanged.
 
 ```python
-from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.base_database import Program
+from skydiscover.optimize.search.in_memory_database import InMemoryProgramDatabase
 
-class MyDatabase(ProgramDatabase):
+class MyDatabase(InMemoryProgramDatabase):
 
     def __init__(self, name: str, config):
         # read any custom config attributes here, before super().__init__,
@@ -224,3 +225,14 @@ search/
 
   utils/                           Shared: checkpointing, logging, serialization
 ```
+
+## PostgreSQL backend
+
+`ProgramDatabase` defines the shared contract without allocating candidate storage.
+`InMemoryProgramDatabase` and `PostgresProgramDatabase` supply the storage behavior.
+Each native algorithm has an `InMemory*ProgramDatabase` and a
+`*PostgresProgramDatabase` subclass. Existing names such as `BestOfNDatabase`
+remain aliases for memory classes. The registry selects `(backend, search_type)`;
+`register_database(name, cls, backend="postgres")` requires a subclass of the
+shared PostgreSQL backend. The schema and migrations live in `persistence/schema.py`.
+See [PostgreSQL runs](../../../docs/content/docs/optimize/postgres.mdx) for setup.

@@ -10,6 +10,7 @@ from skydiscover.optimize.config import Config, DatabaseConfig, build_output_dir
 
 if TYPE_CHECKING:
     from skydiscover.optimize.config import LLMConfig
+
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
 from skydiscover.optimize.search.default_discovery_controller import (
     DiscoveryController,
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 ######################### REGISTRY #########################
 
 _PROGRAM_REGISTRY: Dict[str, Type[Program]] = {}
-_DATABASE_REGISTRY: Dict[str, Type[ProgramDatabase]] = {}
+_DATABASE_REGISTRY: Dict[Tuple[str, str], Type[ProgramDatabase]] = {}
 _CONTROLLER_REGISTRY: Dict[str, Type[DiscoveryController]] = {}
 
 
@@ -36,9 +37,18 @@ def register_program(search_type: str, program_class: Type[Program]) -> None:
     )
 
 
-def register_database(search_type: str, database_class: Type[ProgramDatabase]) -> None:
+def register_database(
+    search_type: str, database_class: Type[ProgramDatabase], backend: str = "memory"
+) -> None:
     """Register a database class for a search type."""
-    _DATABASE_REGISTRY[search_type] = database_class
+    if backend not in ("memory", "postgres"):
+        raise ValueError(f"Unknown database backend: {backend}")
+    if backend == "postgres":
+        from skydiscover.optimize.search.postgres_database import PostgresProgramDatabase
+
+        if not issubclass(database_class, PostgresProgramDatabase):
+            raise TypeError("PostgreSQL implementations must inherit PostgresProgramDatabase")
+    _DATABASE_REGISTRY[(backend, search_type)] = database_class
     logger.debug(
         f"Registered database class '{database_class.__name__}' for search type '{search_type}'"
     )
@@ -62,22 +72,72 @@ def create_database(search_type: str, config: DatabaseConfig) -> ProgramDatabase
     Supports both registered search types and dynamic loading for "evox"/"evolve" types
     when a custom database_file_path is specified.
     """
+    if config.backend not in ("memory", "postgres"):
+        raise ValueError(f"Unknown database backend: {config.backend}")
+    if config.run_id and config.backend != "postgres":
+        raise ValueError("Run ID resume requires the PostgreSQL backend")
     if search_type in ("evox", "evolve") and getattr(config, "database_file_path", None):
-        database_class, program_class = load_database_from_file(config.database_file_path)
-        db = database_class(search_type, config)
-        db._program_class = program_class
-        return db
+        import tempfile
+        from pathlib import Path
 
-    if search_type not in _DATABASE_REGISTRY:
-        available_types = ", ".join(sorted(_DATABASE_REGISTRY.keys()))
-        raise ValueError(
-            f"Unknown search type: '{search_type}'. "
-            f"Available types: {available_types}. "
-            f"For 'evox'/'evolve' type with custom database, set config.search.database.database_file_path"
+        source = Path(config.database_file_path).read_text()
+        if config.backend == "postgres" and config.run_id:
+            from skydiscover.optimize.search.persistence.schema import connect
+
+            with connect(config.postgres_dsn) as conn:
+                row = conn.execute(
+                    "SELECT s.source FROM skydiscover.strategies s JOIN skydiscover.runs r "
+                    "ON (r.id=s.run_id AND r.active_revision=s.revision) WHERE r.id=%s",
+                    (config.run_id,),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"Unknown run ID {config.run_id}")
+                source = row[0] or source
+        with tempfile.TemporaryDirectory(prefix="skydiscover-strategy-") as directory:
+            path = os.path.join(directory, "strategy.py")
+            Path(path).write_text(source)
+            database_class, program_class = load_database_from_file(path, backend=config.backend)
+            db = database_class(search_type, config)
+            db._program_class = program_class
+            if config.backend == "postgres":
+                db._open()
+                db.set_strategy_source(source)
+            return db
+
+    if config.backend == "postgres":
+        from skydiscover.optimize.search.postgres_algorithms import (
+            AdaEvolvePostgresProgramDatabase,
+            BeamSearchPostgresProgramDatabase,
+            BestOfNPostgresProgramDatabase,
+            ClaudeCodePostgresProgramDatabase,
+            GEPANativePostgresProgramDatabase,
+            OpenEvolveNativePostgresProgramDatabase,
+            SearchStrategyPostgresProgramDatabase,
+            TopKPostgresProgramDatabase,
         )
 
-    database_class = _DATABASE_REGISTRY[search_type]
-    return database_class(search_type, config)
+        postgres_classes = {
+            "best_of_n": BestOfNPostgresProgramDatabase,
+            "topk": TopKPostgresProgramDatabase,
+            "beam_search": BeamSearchPostgresProgramDatabase,
+            "claude_code": ClaudeCodePostgresProgramDatabase,
+            "adaevolve": AdaEvolvePostgresProgramDatabase,
+            "openevolve_native": OpenEvolveNativePostgresProgramDatabase,
+            "gepa_native": GEPANativePostgresProgramDatabase,
+            "evox_meta": SearchStrategyPostgresProgramDatabase,
+        }
+        for algorithm, cls in postgres_classes.items():
+            if ("postgres", algorithm) not in _DATABASE_REGISTRY:
+                register_database(algorithm, cls, backend="postgres")
+    key = (config.backend, search_type)
+    if key not in _DATABASE_REGISTRY:
+        available = ", ".join(
+            sorted(name for backend, name in _DATABASE_REGISTRY if backend == config.backend)
+        )
+        raise ValueError(
+            f"Unknown search type '{search_type}' for backend '{config.backend}'. Available types: {available}"
+        )
+    return _DATABASE_REGISTRY[key](search_type, config)
 
 
 def get_program(
@@ -123,6 +183,7 @@ def setup_search(
     output_dir: Optional[str] = None,
     evaluator_env_vars: Optional[Dict[str, str]] = None,
     parent_llm_config: Optional["LLMConfig"] = None,
+    database_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DiscoveryControllerInput, str]:
     """
     Load config, create database, and build a DiscoveryControllerInput from a config path.
@@ -168,6 +229,8 @@ def setup_search(
     if config.file_suffix == ".py":
         config.file_suffix = file_extension
 
+    for key, value in (database_overrides or {}).items():
+        setattr(config.search.database, key, value)
     database = create_database(config.search.type, config.search.database)
 
     if not output_dir:

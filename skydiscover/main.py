@@ -85,6 +85,7 @@ def _wire(agent: str, project: Path, no_hook: bool) -> None:
 # rather than this parser's. They are dispatched before argparse runs, because
 # argparse.REMAINDER lets the parent parser swallow a leading option like --help.
 _FORWARDED = {
+    "db": ("skydiscover.optimize.search.persistence.schema", "manage the shared PostgreSQL schema"),
     "optimize": (
         "skydiscover.optimize.cli",
         "run a discovery search against an evaluator (Optimize)",

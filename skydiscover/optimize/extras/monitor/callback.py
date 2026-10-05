@@ -95,7 +95,7 @@ def _push_program_event(
     # Image path from metadata (image evolution mode)
     image_path = (getattr(program, "metadata", {}) or {}).get("image_path")
 
-    total_programs = len(database.programs) if hasattr(database, "programs") else 0
+    total_programs = database.count() if hasattr(database, "programs") else 0
     best_prog = database.get_best_program() if hasattr(database, "get_best_program") else None
     best_score = 0.0
     if best_prog and best_prog.metrics:

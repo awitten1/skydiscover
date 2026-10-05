@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from skydiscover.optimize.config import DatabaseConfig
-from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.base_database import Program
+from skydiscover.optimize.search.in_memory_database import (
+    InMemoryProgramDatabase as ProgramDatabase,
+)
 
 logger = logging.getLogger(__name__)
 

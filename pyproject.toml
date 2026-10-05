@@ -19,6 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]
 math = [
     "scipy>=1.11.0",
     "sympy>=1.14.0",

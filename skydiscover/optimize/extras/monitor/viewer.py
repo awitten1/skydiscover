@@ -139,6 +139,43 @@ def load_programs(ckpt_dir: str) -> Tuple[List[Dict], Optional[str], int]:
     return prog_list, best_program_id, last_iteration
 
 
+def load_postgres_run(dsn: str, run_id: str):
+    """Read a consistent snapshot without acquiring the run's writer lock."""
+    import uuid
+
+    from skydiscover.optimize.search.persistence.schema import connect
+    from skydiscover.optimize.search.persistence.state import restore_data
+
+    run_id = str(uuid.UUID(run_id))
+    with connect(dsn) as conn, conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        row = conn.execute(
+            "SELECT r.next_iteration,s.state FROM skydiscover.runs r "
+            "JOIN skydiscover.strategies s ON (r.id=s.run_id AND r.active_revision=s.revision) "
+            "WHERE r.id=%s",
+            (run_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Unknown PostgreSQL run {run_id}")
+        state = dict(row[1].get("value", []))
+        programs = [
+            restore_data(r[0])
+            for r in conn.execute(
+                "SELECT data FROM skydiscover.programs WHERE run_id=%s ORDER BY iteration,ordinal",
+                (run_id,),
+            ).fetchall()
+        ]
+        prompts: Dict[str, Dict] = {}
+        for pid, key, data in conn.execute(
+            "SELECT program_id,template_key,data FROM skydiscover.prompts WHERE run_id=%s",
+            (run_id,),
+        ).fetchall():
+            prompts.setdefault(pid, {})[key] = data
+        for program in programs:
+            program["prompts"] = prompts.get(program["id"], program.get("prompts"))
+        return programs, state.get("best_program_id"), max(0, row[0] - 1)
+
+
 def _to_monitor_format(prog: Dict, all_progs: Dict[str, Dict]) -> Dict:
     """Convert checkpoint program dict → monitor event program dict."""
     metrics = prog.get("metrics") or {}
@@ -209,7 +246,11 @@ def main(argv: "list[str] | None" = None, prog: "str | None" = None) -> None:
         prog=prog,
         description="Replay viewer for completed SkyDiscover runs",
     )
-    parser.add_argument("path", help="Output directory or checkpoint path")
+    parser.add_argument("path", help="Output directory, checkpoint path, or PostgreSQL run ID")
+    parser.add_argument(
+        "--postgres-dsn",
+        help="Read a PostgreSQL run (defaults to SKYDISCOVER_POSTGRES_DSN for a run ID)",
+    )
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
@@ -224,14 +265,24 @@ def main(argv: "list[str] | None" = None, prog: "str | None" = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    # Resolve checkpoint
-    ckpt_dir = find_checkpoint_dir(args.path)
-    if not ckpt_dir:
-        print(f"Error: no checkpoint data found in '{args.path}'")
-        sys.exit(1)
+    import uuid
 
-    logger.debug(f"Loading from: {ckpt_dir}")
-    prog_list, best_id, last_iter = load_programs(ckpt_dir)
+    try:
+        uuid.UUID(args.path)
+        is_run_id = True
+    except ValueError:
+        is_run_id = False
+    dsn = args.postgres_dsn or (os.environ.get("SKYDISCOVER_POSTGRES_DSN") if is_run_id else None)
+    if dsn:
+        prog_list, best_id, last_iter = load_postgres_run(dsn, args.path)
+        ckpt_dir = args.path
+    else:
+        ckpt_dir = find_checkpoint_dir(args.path)
+        if not ckpt_dir:
+            print(f"Error: no checkpoint data found in '{args.path}'")
+            sys.exit(1)
+        logger.debug(f"Loading from: {ckpt_dir}")
+        prog_list, best_id, last_iter = load_programs(ckpt_dir)
     if not prog_list:
         print(f"Error: no programs found in '{ckpt_dir}'")
         sys.exit(1)

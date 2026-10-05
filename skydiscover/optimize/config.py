@@ -393,6 +393,11 @@ class EvaluatorConfig:
 class DatabaseConfig:
     """Base configuration shared by all database types."""
 
+    backend: str = "memory"
+    postgres_dsn: Optional[str] = field(
+        default_factory=lambda: os.environ.get("SKYDISCOVER_POSTGRES_DSN"), repr=False
+    )
+    run_id: Optional[str] = None
     db_path: Optional[str] = None
     log_prompts: bool = True
     # RNG seed for reproducible selection. None (the default) draws from OS entropy,

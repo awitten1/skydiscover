@@ -150,6 +150,16 @@ class ClaudeCodeController(DiscoveryController):
     # Main discovery loop
     # ------------------------------------------------------------------
 
+    def _commit_snapshot(self, program, iteration):
+        with self.database.operation():
+            self.database.add(program, iteration=iteration)
+            if self.database.durable:
+                # Claude owns the turn loop. A saved snapshot acknowledges the
+                # turns through this boundary; resume starts a new CLI session
+                # from the stored best solution.
+                for completed in range(self.database.next_iteration, iteration + 1):
+                    self._complete_iteration(completed)
+
     async def run_discovery(
         self,
         start_iteration: int,
@@ -383,7 +393,7 @@ class ClaudeCodeController(DiscoveryController):
                     continue
                 last_ckpt_content = cur
                 ckpt_count += 1
-                iteration = max(cumulative_turns, ckpt_count)
+                iteration = start_iteration + max(cumulative_turns, ckpt_count) - 1
                 try:
                     pid = str(uuid.uuid4())
                     er = await self.evaluator.evaluate_program(cur, pid)
@@ -398,7 +408,7 @@ class ClaudeCodeController(DiscoveryController):
                         metadata={"claude_code_checkpoint_turn": cumulative_turns},
                         artifacts=er.artifacts,
                     )
-                    self.database.add(prog, iteration=iteration)
+                    self._commit_snapshot(prog, iteration)
                     score = er.metrics.get("combined_score", "?")
                     _write_progress(f"[CHECKPOINT] turn ~{cumulative_turns}, score={score}")
                     if checkpoint_callback and ckpt_count % ckpt_interval == 0:
@@ -429,7 +439,9 @@ class ClaudeCodeController(DiscoveryController):
                     pass
 
             eval_result = await self._final_evaluation(solution_path, initial_code, initial)
-            final_iter = max(actual_turns, 1)
+            final_iter = max(
+                start_iteration + max(actual_turns, 1) - 1, self.database.last_iteration
+            )
 
             program = Program(
                 id=str(uuid.uuid4()),
@@ -446,7 +458,7 @@ class ClaudeCodeController(DiscoveryController):
                 },
                 artifacts=eval_result.er.artifacts,
             )
-            self.database.add(program, iteration=final_iter)
+            self._commit_snapshot(program, final_iter)
 
             if checkpoint_callback:
                 checkpoint_callback(final_iter)

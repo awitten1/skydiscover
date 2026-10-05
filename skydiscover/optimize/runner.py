@@ -45,8 +45,18 @@ class Runner:
         config: Optional[Config] = None,
         output_dir: Optional[str] = None,
         evaluator_env_vars: Optional[dict[str, str]] = None,
+        resume: Optional[str] = None,
     ):
         self.config = config if config is not None else load_config(config_path)
+        if resume:
+            import copy
+
+            # A resume argument must not turn the caller's reusable config into
+            # a permanent reference to this run.
+            self.config = copy.copy(self.config)
+            self.config.search = copy.copy(self.config.search)
+            self.config.search.database = copy.copy(self.config.search.database)
+            self.config.search.database.run_id = resume
         self.name = self.config.search.type
         self.output_dir = output_dir or build_output_dir(
             self.name, initial_program_path or "scratch"
@@ -73,7 +83,13 @@ class Runner:
 
         # Create the database
         self.database = create_database(self.config.search.type, self.config.search.database)
-        self.database.language = self.config.language or "python"
+        self.run_id = self.database.run_id
+        with self.database.operation():
+            self.database.language = self.config.language or "python"
+        if self.run_id:
+            logger.info("PostgreSQL run ID: %s", self.run_id)
+            with open(os.path.join(self.output_dir, "run_id.json"), "w") as f:
+                json.dump({"run_id": self.run_id}, f)
         self.evaluation_file = evaluation_file
         self.evaluator_env_vars = dict(evaluator_env_vars or {})
 
@@ -109,17 +125,26 @@ class Runner:
     @property
     def initial_score(self) -> Optional[float]:
         """Score of the seed program, or None if unavailable."""
-        if not self.database or not self.database.programs or not self.initial_program_solution:
+        if hasattr(self, "_initial_score_cached"):
+            return self._initial_score_cached
+        if self.database.durable and self.database.initial_program_id:
+            seed = self.database.get(self.database.initial_program_id)
+            return get_score(seed.metrics) if seed and seed.metrics else None
+        if (
+            not self.database
+            or not self.database.has_programs()
+            or not self.initial_program_solution
+        ):
             return None
 
         seed_solution = self.initial_program_solution
         seed_prog = None
-        for prog in self.database.programs.values():
+        for prog in self.database.iter_programs():
             if prog.solution == seed_solution:
                 seed_prog = prog
                 break
         if seed_prog is None:
-            for prog in self.database.programs.values():
+            for prog in self.database.iter_programs():
                 if prog.iteration_found == 0:
                     seed_prog = prog
                     break
@@ -129,6 +154,20 @@ class Runner:
         return None
 
     async def run(
+        self, iterations: Optional[int] = None, checkpoint_path: Optional[str] = None
+    ) -> Optional[Program]:
+        """Run discovery and release the durable run lock on completion."""
+        try:
+            return await self._run(iterations, checkpoint_path)
+        finally:
+            self._sync_database()
+            if self.database.durable:
+                try:
+                    self._initial_score_cached = self.initial_score
+                finally:
+                    self.database.close()
+
+    async def _run(
         self,
         iterations: Optional[int] = None,
         checkpoint_path: Optional[str] = None,
@@ -145,7 +184,11 @@ class Runner:
         max_iterations = iterations if iterations is not None else self.config.max_iterations
 
         start_iteration = 0
-        if checkpoint_path and os.path.exists(checkpoint_path):
+        if self.database.durable:
+            if checkpoint_path:
+                raise ValueError("PostgreSQL resume uses a run ID, not a checkpoint path")
+            start_iteration = self.database.next_iteration
+        elif checkpoint_path and os.path.exists(checkpoint_path):
             self._load_checkpoint(checkpoint_path)
             start_iteration = self.database.last_iteration + 1
             logger.info(f"Resuming from iteration {start_iteration}")
@@ -164,11 +207,12 @@ class Runner:
 
         # Get the discovery controller
         self.discovery_controller = get_discovery_controller(controller_input)
+        self.discovery_controller.restore_run_state(self.database.get_controller_state())
 
         # Add initial program to database if not resuming
         should_add_initial = (
             start_iteration == 0
-            and len(self.database.programs) == 0
+            and self.database.count() == 0
             and self.initial_program_solution is not None
         )
 
@@ -176,7 +220,7 @@ class Runner:
             await self._add_initial_program(start_iteration)
         else:
             logger.info(
-                f"Resuming from iteration {start_iteration} with {len(self.database.programs)} programs"
+                f"Resuming from iteration {start_iteration} with {self.database.count()} programs"
             )
 
         # Start the monitor
@@ -199,12 +243,12 @@ class Runner:
             await self.discovery_controller.run_discovery(
                 discovery_start,
                 max_iterations,
-                checkpoint_callback=checkpoint_cb,
+                checkpoint_callback=None if self.database.durable else checkpoint_cb,
             )
 
             self._sync_database()
             final_iteration = discovery_start + max_iterations - 1
-            if final_iteration > 0:
+            if final_iteration > 0 and not self.database.durable:
                 self._save_checkpoint(final_iteration)
 
             # Re-evaluate best program in test mode (authoritative score).
@@ -223,6 +267,7 @@ class Runner:
                     )
                     for k, v in test_result.metrics.items():
                         best.metrics[f"test_{k}"] = v
+                    self.database.update(best)
                     logger.info(
                         f"Test evaluation for best program: {format_metrics(test_result.metrics)}"
                     )
@@ -312,12 +357,12 @@ class Runner:
             program.metadata = program.metadata or {}
             program.metadata["image_path"] = initial_image_path
 
-        self.database.add(program)
-        try:
+        with self.database.operation():
+            self.database.add(program)
             self.database.initial_program_id = program.id
             self.database.initial_program_score = get_score(program.metrics or {})
-        except Exception as e:
-            logger.warning(f"Failed to set initial program score: {e}")
+            if self.database.durable:
+                self.database.complete_iteration(0)
 
     # ------------------------------------------------------------------
     # Monitor and feedback setup
@@ -401,12 +446,12 @@ class Runner:
     def _push_existing_to_monitor(self) -> None:
         if not (self._controller.monitor_callback and self.database.programs):
             return
-        for prog in self.database.programs.values():
+        for prog in self.database.iter_programs():
             try:
                 self._controller.monitor_callback(prog, getattr(prog, "iteration_found", 0))
             except Exception:
                 logger.debug("Monitor callback failed for program %s", prog.id, exc_info=True)
-        logger.debug(f"Pushed {len(self.database.programs)} existing program(s) to monitor")
+        logger.debug(f"Pushed {self.database.count()} existing program(s) to monitor")
 
     def _install_signal_handlers(self) -> None:
         def on_signal(signum, frame):

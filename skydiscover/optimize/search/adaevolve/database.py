@@ -26,6 +26,8 @@ from skydiscover.optimize.search.adaevolve.archive import (
 )
 from skydiscover.optimize.search.adaevolve.paradigm import ParadigmTracker
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.in_memory_database import InMemoryProgramDatabase
+from skydiscover.optimize.search.persistence.operations import database_operation
 from skydiscover.optimize.utils.metrics import compute_proxy_score, get_score
 
 logger = logging.getLogger(__name__)
@@ -147,7 +149,7 @@ def get_island_config_preset(name: str) -> Dict[str, Any]:
     raise ValueError(f"Unknown island config preset: {name}")
 
 
-class AdaEvolveDatabase(ProgramDatabase):
+class AdaEvolveDatabaseMethods(ProgramDatabase):
     """
     AdaEvolve population database with adaptive multi-island search.
 
@@ -331,6 +333,7 @@ class AdaEvolveDatabase(ProgramDatabase):
     # =========================================================================
 
     @property
+    @database_operation
     def active_programs(self) -> Dict[str, Program]:
         """Programs currently in all island populations."""
         result = {}
@@ -344,6 +347,7 @@ class AdaEvolveDatabase(ProgramDatabase):
                     result[p.id] = p
         return result
 
+    @database_operation
     def get_island_population(self, island_idx: int) -> List[Program]:
         """Get all programs in a specific island."""
         if 0 <= island_idx < self.num_islands:
@@ -353,6 +357,7 @@ class AdaEvolveDatabase(ProgramDatabase):
                 return list(self.islands[island_idx])
         return []
 
+    @database_operation
     def get_island_size(self, island_idx: int) -> int:
         """Get number of programs in a specific island."""
         if 0 <= island_idx < self.num_islands:
@@ -372,6 +377,7 @@ class AdaEvolveDatabase(ProgramDatabase):
             return EXPLORE_LABEL_PROMPT_OPT, EXPLOIT_LABEL_PROMPT_OPT
         return EXPLORE_LABEL, EXPLOIT_LABEL
 
+    @database_operation
     def seed_all_islands(self, program: Program, iteration: Optional[int] = None) -> None:
         """
         Seed all islands with copies of the initial program.
@@ -405,6 +411,7 @@ class AdaEvolveDatabase(ProgramDatabase):
             f"{[self.get_island_size(i) for i in range(self.num_islands)]}"
         )
 
+    @database_operation
     def add(
         self,
         program: Program,
@@ -494,6 +501,7 @@ class AdaEvolveDatabase(ProgramDatabase):
 
         return program.id
 
+    @database_operation
     def sample(
         self,
         num_context_programs: Optional[int] = 4,
@@ -785,6 +793,7 @@ class AdaEvolveDatabase(ProgramDatabase):
     # Island Lifecycle
     # =========================================================================
 
+    @database_operation
     def end_iteration(self, iteration: int) -> None:
         """
         End-of-iteration housekeeping.
@@ -901,6 +910,7 @@ class AdaEvolveDatabase(ProgramDatabase):
     # Statistics
     # =========================================================================
 
+    @database_operation
     def get_stats(self) -> Dict[str, Any]:
         """Get comprehensive statistics for logging/debugging."""
         adapter_stats = self.adapter.get_stats()
@@ -945,6 +955,7 @@ class AdaEvolveDatabase(ProgramDatabase):
             "islands": island_stats,
         }
 
+    @database_operation
     def get_comprehensive_iteration_stats(
         self,
         iteration: int,
@@ -1526,6 +1537,7 @@ class AdaEvolveDatabase(ProgramDatabase):
     # Helpers
     # =========================================================================
 
+    @database_operation
     def is_multiobjective_enabled(self) -> bool:
         """Return True when explicit Pareto objectives are configured."""
         return bool(self.pareto_objectives)
@@ -1546,6 +1558,7 @@ class AdaEvolveDatabase(ProgramDatabase):
             higher_is_better=self.higher_is_better,
         )
 
+    @database_operation
     def get_program_proxy_score(self, program: Optional[Program]) -> float:
         """Public wrapper for the scalar proxy used by AdaEvolve internals."""
         if program is None:
@@ -1676,6 +1689,7 @@ class AdaEvolveDatabase(ProgramDatabase):
 
         return sorted(front, key=self._get_pareto_representative_sort_key, reverse=True)
 
+    @database_operation
     def get_global_pareto_front(self) -> List[Program]:
         """Return the non-dominated Pareto front across all islands (cached)."""
         if not self.is_multiobjective_enabled():
@@ -1734,6 +1748,7 @@ class AdaEvolveDatabase(ProgramDatabase):
             return True
         return False
 
+    @database_operation
     def get_children(self, parent_id: str, limit: int = 5) -> List[Program]:
         """
         Get recent children of a parent on the current island.
@@ -1771,6 +1786,7 @@ class AdaEvolveDatabase(ProgramDatabase):
     # Query Methods
     # =========================================================================
 
+    @database_operation
     def get_best_program(self, metric: Optional[str] = None) -> Optional[Program]:
         """
         Get the best program across all islands.
@@ -1856,6 +1872,7 @@ class AdaEvolveDatabase(ProgramDatabase):
 
         return best
 
+    @database_operation
     def get_top_programs(self, n: int = 10, metric: Optional[str] = None) -> List[Program]:
         """Get top n programs across all islands.
 
@@ -1892,6 +1909,7 @@ class AdaEvolveDatabase(ProgramDatabase):
         )
         return pareto_front + remaining[: max(0, n - len(pareto_front))]
 
+    @database_operation
     def get_top_programs_for_island(self, island_idx: Optional[int] = None) -> List[Program]:
         """Get top programs for an island (current island if not specified)."""
         idx = island_idx if island_idx is not None else self.current_island
@@ -1907,6 +1925,7 @@ class AdaEvolveDatabase(ProgramDatabase):
                 return sorted_pop[: max(1, len(sorted_pop) // 4)]
         return []
 
+    @database_operation
     def get_pareto_front(self, island_idx: Optional[int] = None) -> List[Program]:
         """Get the Pareto front for a specific island or globally across all islands."""
         if not self.is_multiobjective_enabled():
@@ -1943,6 +1962,7 @@ class AdaEvolveDatabase(ProgramDatabase):
 
         return []
 
+    @database_operation
     def get_archive_stats(self, island_idx: Optional[int] = None) -> Dict[str, Any]:
         """Get archive statistics for an island."""
         idx = island_idx if island_idx is not None else self.current_island
@@ -1961,6 +1981,7 @@ class AdaEvolveDatabase(ProgramDatabase):
     # Program Merging
     # =========================================================================
 
+    @database_operation
     def find_merge_candidates(
         self, island_idx: Optional[int] = None
     ) -> Optional[Tuple[Program, Program, Program]]:
@@ -1976,6 +1997,7 @@ class AdaEvolveDatabase(ProgramDatabase):
         # Legacy mode doesn't support merging
         return None
 
+    @database_operation
     def add_merged_program(
         self,
         program: Program,
@@ -2182,42 +2204,59 @@ class AdaEvolveDatabase(ProgramDatabase):
     # Paradigm Breakthrough
     # =========================================================================
 
+    @database_operation
     def is_paradigm_stagnating(self) -> bool:
         """Check if global improvement rate is below threshold for paradigm generation."""
         if self.paradigm_tracker is None:
             return False
         return self.paradigm_tracker.is_paradigm_stagnating()
 
+    @database_operation
     def has_active_paradigm(self) -> bool:
         """Check if there's an active paradigm available."""
         if self.paradigm_tracker is None:
             return False
         return self.paradigm_tracker.has_active_paradigm()
 
+    @database_operation
     def get_current_paradigm(self) -> Optional[Dict[str, Any]]:
         """Get the current active paradigm if available."""
         if self.paradigm_tracker is None:
             return None
         return self.paradigm_tracker.get_current_paradigm()
 
+    @database_operation
     def use_paradigm(self) -> None:
         """Record one use of the current paradigm."""
         if self.paradigm_tracker is not None:
             self.paradigm_tracker.use_paradigm()
 
+    @database_operation
     def set_paradigms(self, paradigms: List[Dict[str, Any]]) -> None:
         """Set new paradigms from generator."""
         if self.paradigm_tracker is not None:
             self.paradigm_tracker.set_paradigms(paradigms, self._global_best_score)
 
+    @database_operation
     def get_previously_tried_ideas(self) -> List[str]:
         """Get formatted list of previously tried paradigm ideas."""
         if self.paradigm_tracker is None:
             return []
         return self.paradigm_tracker.get_previously_tried_ideas()
 
+    @database_operation
     def get_paradigm_num_to_generate(self) -> int:
         """Get the configured number of paradigms to generate."""
         if self.paradigm_tracker is None:
             return 3
         return self.paradigm_tracker.num_paradigms_to_generate
+
+
+class InMemoryAdaEvolveProgramDatabase(AdaEvolveDatabaseMethods, InMemoryProgramDatabase):
+    """AdaEvolve selection with in-memory storage."""
+
+    pass
+
+
+# Preserve the existing import path.
+AdaEvolveDatabase = InMemoryAdaEvolveProgramDatabase

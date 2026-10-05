@@ -49,6 +49,7 @@ class DiscoveryResult:
     metrics: Dict[str, Any]
     output_dir: Optional[str]
     initial_score: Optional[float] = None
+    run_id: Optional[str] = None
 
     def __repr__(self) -> str:
         init = f"{self.initial_score:.4f}" if self.initial_score is not None else "N/A"
@@ -67,6 +68,7 @@ def run_discovery(
     system_prompt: Optional[str] = None,
     api_base: Optional[str] = None,
     cleanup: bool = True,
+    resume: Optional[str] = None,
 ) -> DiscoveryResult:
     """Run a discovery process and return the best result.
 
@@ -83,6 +85,7 @@ def run_discovery(
         system_prompt: Domain-specific context for the LLM.
         api_base: Base URL for an OpenAI-compatible API.
         cleanup: Remove temp files after the run.
+        resume: PostgreSQL run ID to continue with the same search configuration.
 
     Returns:
         DiscoveryResult with best program, score, solution, metrics, and output directory.
@@ -100,6 +103,7 @@ def run_discovery(
             search=search,
             system_prompt=system_prompt,
             api_base=api_base,
+            resume=resume,
         )
     )
 
@@ -117,6 +121,7 @@ async def _run_discovery_async(
     system_prompt: Optional[str] = None,
     api_base: Optional[str] = None,
     cleanup: bool = True,
+    resume: Optional[str] = None,
 ) -> DiscoveryResult:
     """Async implementation of run_discovery."""
 
@@ -185,6 +190,10 @@ async def _run_discovery_async(
             from skydiscover.optimize.extras.external import KNOWN_EXTERNAL, get_runner, is_external
 
             if is_external(search_type):
+                if config_obj.search.database.backend == "postgres" or resume:
+                    raise ValueError(
+                        "PostgreSQL run storage and resume are supported by native Optimize algorithms only"
+                    )
                 if evaluator_env_vars:
                     env_var_names = ", ".join(sorted(evaluator_env_vars))
                     raise ValueError(
@@ -244,6 +253,7 @@ async def _run_discovery_async(
             config=config_obj,
             output_dir=actual_output_dir,
             evaluator_env_vars=evaluator_env_vars,
+            resume=resume,
         )
 
         best_program = await controller.run(iterations=iterations)
@@ -267,6 +277,7 @@ async def _run_discovery_async(
             metrics=metrics,
             output_dir=actual_output_dir if not cleanup else None,
             initial_score=initial_score,
+            run_id=controller.run_id,
         )
 
     finally:

@@ -81,6 +81,51 @@ class GEPANativeController(DiscoveryController):
             f"max_merge_attempts={self.max_merge_attempts}"
         )
 
+    _DURABLE_FIELDS = (
+        "_best_score_seen",
+        "_iterations_without_improvement",
+        "_merge_due",
+        "_merge_attempts_used",
+        "_merge_pairs_tried",
+    )
+
+    def get_run_state(self):
+        state = super().get_run_state()
+        state.update({key: getattr(self, key) for key in self._DURABLE_FIELDS})
+        return state
+
+    def restore_run_state(self, state):
+        super().restore_run_state(state)
+        for key in self._DURABLE_FIELDS:
+            if key in state:
+                setattr(self, key, state[key])
+
+    def _apply_result(self, result, iteration, checkpoint_callback, post_process_result):
+        with self.database.operation():
+            if result.error:
+                logger.warning(f"Iteration {iteration} failed: {result.error}")
+                self._iterations_without_improvement += 1
+            elif (
+                self.acceptance_gating
+                and result.child_program_dict
+                and result.parent_id
+                and not self._acceptance_gate(result, iteration)
+            ):
+                pass
+            else:
+                if post_process_result:
+                    self._process_iteration_result(result, iteration, checkpoint_callback)
+                if self.use_merge and self._merge_attempts_used < self.max_merge_attempts:
+                    self._merge_due = True
+                child_score = get_score((result.child_program_dict or {}).get("metrics", {}))
+                if result.child_program_dict and child_score > self._best_score_seen:
+                    self._best_score_seen = child_score
+                    self._iterations_without_improvement = 0
+                else:
+                    self._iterations_without_improvement += 1
+            if post_process_result:
+                self._complete_iteration(iteration, result.error, result)
+
     # ------------------------------------------------------------------
     # Main discovery loop
     # ------------------------------------------------------------------
@@ -114,54 +159,16 @@ class GEPANativeController(DiscoveryController):
             if self.shutdown_event.is_set():
                 logger.info("Shutdown requested, stopping discovery loop early")
                 break
-
+            if self.database.is_iteration_complete(iteration):
+                continue
             try:
-                # Proactive merge: attempt before normal iteration if scheduled
                 if self._merge_due:
                     self._merge_due = False
                     await self._attempt_merge(iteration)
-
                 result = await self._run_iteration(iteration, retry_times=retry_times)
-
-                if result.error:
-                    logger.warning(f"Iteration {iteration} failed: {result.error}")
-                    self._iterations_without_improvement += 1
-
-                    if self._should_merge():
-                        await self._attempt_merge(iteration)
-                    continue
-
-                # --- Acceptance gating (skip for from-scratch programs) ---
-                if self.acceptance_gating and result.child_program_dict and result.parent_id:
-                    accepted = self._acceptance_gate(result, iteration)
-                    if not accepted:
-                        if self._should_merge():
-                            await self._attempt_merge(iteration)
-                        continue
-
-                # --- Accept: process normally ---
-                if post_process_result:
-                    self._process_iteration_result(result, iteration, checkpoint_callback)
-
-                # Schedule a proactive merge after successful acceptance
-                if self.use_merge and self._merge_attempts_used < self.max_merge_attempts:
-                    self._merge_due = True
-
-                # Track improvement
-                if result.child_program_dict:
-                    child_score = get_score(result.child_program_dict.get("metrics", {}))
-                    if child_score > self._best_score_seen:
-                        self._best_score_seen = child_score
-                        self._iterations_without_improvement = 0
-                    else:
-                        self._iterations_without_improvement += 1
-                else:
-                    self._iterations_without_improvement += 1
-
-                # Stagnation-triggered merge (fallback)
+                self._apply_result(result, iteration, checkpoint_callback, post_process_result)
                 if self._should_merge():
                     await self._attempt_merge(iteration)
-
             except Exception as e:
                 logger.exception(f"Error in iteration {iteration}: {e}")
                 self._iterations_without_improvement += 1
@@ -211,8 +218,8 @@ class GEPANativeController(DiscoveryController):
         # Pre-compute parent scores for rejected programs
         rejection_parent_scores: Dict[str, float] = {}
         for prog in rejected:
-            if prog.parent_id and prog.parent_id in self.database.programs:
-                p = self.database.programs[prog.parent_id]
+            p = self.database.get(prog.parent_id) if prog.parent_id else None
+            if p is not None:
                 rejection_parent_scores[prog.parent_id] = get_score(p.metrics)
 
         context: Dict[str, Any] = {
@@ -250,13 +257,20 @@ class GEPANativeController(DiscoveryController):
         child_score = get_score(result.child_program_dict.get("metrics", {}))
 
         parent_score = 0.0
-        if result.parent_id and result.parent_id in self.database.programs:
-            parent = self.database.programs[result.parent_id]
+        parent = self.database.get(result.parent_id) if result.parent_id else None
+        if parent is not None:
             parent_score = get_score(parent.metrics)
 
         if child_score <= parent_score:
             child = Program.from_dict(result.child_program_dict)
             self.database.add_rejected(child)
+            if result.prompt:
+                self.database.log_prompt(
+                    child.id,
+                    "rejected_generation",
+                    result.prompt,
+                    [result.llm_response] if result.llm_response else [],
+                )
 
             logger.debug(
                 f"Iteration {iteration}: REJECTED child "
@@ -280,6 +294,12 @@ class GEPANativeController(DiscoveryController):
         )
 
     async def _attempt_merge(self, iteration: int) -> None:
+        try:
+            await self._attempt_merge_impl(iteration)
+        finally:
+            self.database.save_controller_state(self.get_run_state())
+
+    async def _attempt_merge_impl(self, iteration: int) -> None:
         """Attempt an LLM-mediated merge of two complementary programs.
 
         Guards against budget exhaustion, self-merges, and duplicate pairs.
@@ -290,7 +310,7 @@ class GEPANativeController(DiscoveryController):
         if self._merge_attempts_used >= self.max_merge_attempts:
             return
 
-        if len(self.database.programs) < 2:
+        if self.database.count() < 2:
             logger.debug("Not enough programs for merge, skipping")
             return
 
@@ -361,58 +381,61 @@ class GEPANativeController(DiscoveryController):
         )
 
         # GEPA acceptance criterion for merges: must meet or exceed both parents
-        if merged_score >= max(score_a, score_b):
-            merged_program = Program(
-                id=child_id,
-                solution=child_solution,
-                language=self.config.language,
-                metrics=eval_result.metrics,
-                iteration_found=iteration,
-                parent_id=prog_a.id,
-                other_context_ids=[prog_b.id],
-                parent_info=("Merge Parent A", prog_a.id),
-                context_info=[("Merge Parent B", prog_b.id)],
-                metadata={
-                    "changes": "LLM-mediated merge",
-                    "merge_score_a": score_a,
-                    "merge_score_b": score_b,
-                    "parent_metrics": prog_a.metrics,
-                },
-                artifacts=eval_result.artifacts or {},
-            )
-            self.database.add(merged_program, iteration=iteration)
+        with self.database.operation():
+            if merged_score >= max(score_a, score_b):
+                merged_program = Program(
+                    id=child_id,
+                    solution=child_solution,
+                    language=self.config.language,
+                    metrics=eval_result.metrics,
+                    iteration_found=iteration,
+                    parent_id=prog_a.id,
+                    other_context_ids=[prog_b.id],
+                    parent_info=("Merge Parent A", prog_a.id),
+                    context_info=[("Merge Parent B", prog_b.id)],
+                    metadata={
+                        "changes": "LLM-mediated merge",
+                        "merge_score_a": score_a,
+                        "merge_score_b": score_b,
+                        "parent_metrics": prog_a.metrics,
+                    },
+                    artifacts=eval_result.artifacts or {},
+                )
+                self.database.add(merged_program, iteration=iteration)
 
-            self.database.log_prompt(
-                template_key="merge",
-                program_id=child_id,
-                prompt=merge_prompt,
-                responses=[llm_response],  # already str via .text extraction above
-            )
+                self.database.log_prompt(
+                    template_key="merge",
+                    program_id=child_id,
+                    prompt=merge_prompt,
+                    responses=[llm_response],  # already str via .text extraction above
+                )
 
-            logger.debug(
-                f"Merge ACCEPTED: score={merged_score:.4f} "
-                f"(>= max({score_a:.4f}, {score_b:.4f}))"
-            )
+                logger.debug(
+                    f"Merge ACCEPTED: score={merged_score:.4f} "
+                    f"(>= max({score_a:.4f}, {score_b:.4f}))"
+                )
 
-            if merged_score > self._best_score_seen:
-                self._best_score_seen = merged_score
+                if merged_score > self._best_score_seen:
+                    self._best_score_seen = merged_score
 
-            # Reset stagnation only on successful merge
-            self._iterations_without_improvement = 0
+                # Reset stagnation only on successful merge
+                self._iterations_without_improvement = 0
 
-            # Fire monitor callback
-            if self.monitor_callback:
-                try:
-                    self.monitor_callback(merged_program, iteration)
-                except Exception as e:
-                    logger.warning(
-                        f"Monitor callback failed: {e}"
-                    )  # Never crash discovery due to monitor
-        else:
-            logger.debug(
-                f"Merge REJECTED: score={merged_score:.4f} " f"< max({score_a:.4f}, {score_b:.4f})"
-            )
-            # Stagnation counter NOT reset on rejected merge
+                # Fire monitor callback
+                if self.monitor_callback:
+                    try:
+                        self.monitor_callback(merged_program, iteration)
+                    except Exception as e:
+                        logger.warning(
+                            f"Monitor callback failed: {e}"
+                        )  # Never crash discovery due to monitor
+            else:
+                logger.debug(
+                    f"Merge REJECTED: score={merged_score:.4f} "
+                    f"< max({score_a:.4f}, {score_b:.4f})"
+                )
+                # Stagnation counter NOT reset on rejected merge
+            self.database.save_controller_state(self.get_run_state())
 
     def _build_merge_prompt(self, prog_a: Program, prog_b: Program) -> Dict[str, str]:
         """Build a prompt asking the LLM to merge two programs.

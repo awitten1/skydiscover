@@ -4,6 +4,8 @@ from typing import Dict, List, Optional, Tuple
 
 from skydiscover.optimize.config import DatabaseConfig
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.in_memory_database import InMemoryProgramDatabase
+from skydiscover.optimize.search.persistence.operations import database_operation
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +15,13 @@ class SearchStrategy(Program):
     """Program entry for the search strategy database."""
 
 
-class SearchStrategyDatabase(ProgramDatabase):
+class SearchStrategyDatabaseMethods(ProgramDatabase):
     """Database for storing and sampling evolved search strategy programs."""
 
     def __init__(self, name: str, config: DatabaseConfig):
         super().__init__(name, config)
 
+    @database_operation
     def add(self, program: SearchStrategy, iteration: Optional[int] = None, **kwargs) -> str:
         """Add a program to the database."""
         self.programs[program.id] = program
@@ -34,6 +37,7 @@ class SearchStrategyDatabase(ProgramDatabase):
         logger.debug(f"Added program {program.id} to evolve database")
         return program.id
 
+    @database_operation
     def sample(
         self, num_context_programs: Optional[int] = 4, **kwargs
     ) -> Tuple[Dict[str, SearchStrategy], Dict[str, List[SearchStrategy]]]:
@@ -58,3 +62,13 @@ class SearchStrategyDatabase(ProgramDatabase):
         )
         other_context_programs = [p for p in other_context_programs if p.id != parent.id]
         return {"": parent}, {"": other_context_programs}
+
+
+class InMemorySearchStrategyProgramDatabase(SearchStrategyDatabaseMethods, InMemoryProgramDatabase):
+    """SearchStrategy selection with in-memory storage."""
+
+    pass
+
+
+# Preserve the existing import path.
+SearchStrategyDatabase = InMemorySearchStrategyProgramDatabase

@@ -3,11 +3,13 @@ from typing import Dict, List, Optional, Tuple
 
 from skydiscover.optimize.config import DatabaseConfig
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.in_memory_database import InMemoryProgramDatabase
+from skydiscover.optimize.search.persistence.operations import database_operation
 
 logger = logging.getLogger(__name__)
 
 
-class BestOfNDatabase(ProgramDatabase):
+class BestOfNDatabaseMethods(ProgramDatabase):
     """
     Database implementing "best of N" strategy.
 
@@ -30,6 +32,7 @@ class BestOfNDatabase(ProgramDatabase):
 
         logger.debug(f"BestOfNDatabase initialized: N={self.n}")
 
+    @database_operation
     def add(self, program: Program, iteration: Optional[int] = None, **kwargs) -> str:
         """
         Add a program to the database and increment parent iteration count.
@@ -57,6 +60,7 @@ class BestOfNDatabase(ProgramDatabase):
         )
         return program.id
 
+    @database_operation
     def sample(
         self, num_context_programs: Optional[int] = 4, **kwargs
     ) -> Tuple[Program, List[Program]]:
@@ -124,3 +128,13 @@ class BestOfNDatabase(ProgramDatabase):
             )
 
         return parent, other_context_programs
+
+
+class InMemoryBestOfNProgramDatabase(BestOfNDatabaseMethods, InMemoryProgramDatabase):
+    """BestOfN selection with in-memory storage."""
+
+    pass
+
+
+# Preserve the existing import path.
+BestOfNDatabase = InMemoryBestOfNProgramDatabase

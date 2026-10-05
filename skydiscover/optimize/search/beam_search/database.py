@@ -20,11 +20,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from skydiscover.optimize.config import DatabaseConfig
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.in_memory_database import InMemoryProgramDatabase
+from skydiscover.optimize.search.persistence.operations import database_operation
 
 logger = logging.getLogger(__name__)
 
 
-class BeamSearchDatabase(ProgramDatabase):
+class BeamSearchDatabaseMethods(ProgramDatabase):
     """
     Database implementing beam search for parent selection.
 
@@ -80,6 +82,7 @@ class BeamSearchDatabase(ProgramDatabase):
             f"strategy={self.selection_strategy}, diversity_weight={self.diversity_weight}"
         )
 
+    @database_operation
     def add(self, program: Program, iteration: Optional[int] = None, **kwargs) -> str:
         """
         Add a program to the database and update the beam.
@@ -290,6 +293,7 @@ class BeamSearchDatabase(ProgramDatabase):
 
         return score
 
+    @database_operation
     def sample(
         self, num_context_programs: Optional[int] = 4, **kwargs
     ) -> Tuple[Program, List[Program]]:
@@ -340,7 +344,7 @@ class BeamSearchDatabase(ProgramDatabase):
         Returns:
             Selected parent program
         """
-        beam_list = [self.programs[pid] for pid in self.beam if pid in self.programs]
+        beam_list = [self.programs[pid] for pid in sorted(self.beam) if pid in self.programs]
 
         if not beam_list:
             raise ValueError("Beam is empty, cannot select parent")
@@ -422,7 +426,7 @@ class BeamSearchDatabase(ProgramDatabase):
             fitness = self._get_program_score(prog)
 
             # Calculate diversity from expanded programs
-            recent_expanded = list(self.expanded)[-10:]  # Last 10 expanded
+            recent_expanded = sorted(self.expanded)[-10:]  # Stable subset of expansion history
             if recent_expanded:
                 diversity = sum(
                     self._solution_distance(prog.solution, self.programs[eid].solution)
@@ -453,6 +457,7 @@ class BeamSearchDatabase(ProgramDatabase):
         best_idx = combined_scores.index(max(combined_scores))
         return candidates[best_idx]
 
+    @database_operation
     def get_beam_programs(self) -> List[Program]:
         """
         Get all programs currently in the beam.
@@ -460,9 +465,10 @@ class BeamSearchDatabase(ProgramDatabase):
         Returns:
             List of programs in the beam, sorted by score (descending)
         """
-        beam_programs = [self.programs[pid] for pid in self.beam if pid in self.programs]
+        beam_programs = [self.programs[pid] for pid in sorted(self.beam) if pid in self.programs]
         return sorted(beam_programs, key=self._get_program_score, reverse=True)
 
+    @database_operation
     def get_unexpanded_beam(self) -> List[Program]:
         """
         Get beam programs that haven't been expanded yet.
@@ -474,11 +480,12 @@ class BeamSearchDatabase(ProgramDatabase):
         """
         unexpanded = [
             self.programs[pid]
-            for pid in self.beam
+            for pid in sorted(self.beam)
             if pid in self.programs and pid not in self.expanded
         ]
         return sorted(unexpanded, key=self._get_program_score, reverse=True)
 
+    @database_operation
     def get_search_stats(self) -> Dict:
         """
         Get statistics about the beam search progress.
@@ -500,6 +507,7 @@ class BeamSearchDatabase(ProgramDatabase):
             ),
         }
 
+    @database_operation
     def log_status(self) -> None:
         """Log the status of the beam search database."""
         stats = self.get_search_stats()
@@ -642,7 +650,7 @@ class BeamSearchDatabase(ProgramDatabase):
         - Depth information is missing for some programs
         """
         # Remove invalid beam entries (programs that don't exist)
-        valid_beam = {pid for pid in self.beam if pid in self.programs}
+        valid_beam = {pid for pid in sorted(self.beam) if pid in self.programs}
         if len(valid_beam) != len(self.beam):
             removed = len(self.beam) - len(valid_beam)
             logger.warning(f"Removed {removed} invalid entries from beam")
@@ -703,3 +711,13 @@ class BeamSearchDatabase(ProgramDatabase):
             if pid not in self.depth:
                 self.depth[pid] = 0
                 logger.warning(f"Orphaned program {pid}, assigned depth 0")
+
+
+class InMemoryBeamSearchProgramDatabase(BeamSearchDatabaseMethods, InMemoryProgramDatabase):
+    """BeamSearch selection with in-memory storage."""
+
+    pass
+
+
+# Preserve the existing import path.
+BeamSearchDatabase = InMemoryBeamSearchProgramDatabase

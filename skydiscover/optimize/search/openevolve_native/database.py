@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from skydiscover.optimize.config import DatabaseConfig
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.in_memory_database import InMemoryProgramDatabase
+from skydiscover.optimize.search.persistence.operations import database_operation
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +90,7 @@ def _get_fitness(
 # ===========================================================================
 
 
-class OpenEvolveNativeDatabase(ProgramDatabase):
+class OpenEvolveNativeDatabaseMethods(ProgramDatabase):
     """Island-based MAP-Elites database — native port of OpenEvolve."""
 
     # ------------------------------------------------------------------
@@ -165,6 +167,7 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
     # sample()
     # ==================================================================
 
+    @database_operation
     def sample(
         self,
         num_context_programs: Optional[int] = 4,
@@ -196,6 +199,7 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
     # add()
     # ==================================================================
 
+    @database_operation
     def add(
         self,
         program: Program,
@@ -296,7 +300,7 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
         if not island_programs:
             return self._seed_empty_island(self.current_island)
 
-        valid = [pid for pid in island_programs if pid in self.programs]
+        valid = [pid for pid in sorted(island_programs) if pid in self.programs]
         # Remove stale refs
         if len(valid) < len(island_programs):
             for stale in island_programs - set(valid):
@@ -312,7 +316,7 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
         if not self.archive:
             return self._sample_exploration_parent()
 
-        valid_archive = [pid for pid in self.archive if pid in self.programs]
+        valid_archive = [pid for pid in sorted(self.archive) if pid in self.programs]
         # Remove stale refs
         if len(valid_archive) < len(self.archive):
             for stale in self.archive - set(valid_archive):
@@ -369,7 +373,7 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
           4. Random fill from island
         """
         parent_island = parent.metadata.get("island", self.current_island)
-        island_program_ids = list(self.islands[parent_island])
+        island_program_ids = sorted(self.islands[parent_island])
         island_programs = [self.programs[pid] for pid in island_program_ids if pid in self.programs]
 
         if not island_programs:
@@ -724,7 +728,9 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
             if best_id not in self.programs or best_id not in self.islands[i]:
                 self.island_best_programs[i] = None
                 # Recalculate
-                progs = [self.programs[pid] for pid in self.islands[i] if pid in self.programs]
+                progs = [
+                    self.programs[pid] for pid in sorted(self.islands[i]) if pid in self.programs
+                ]
                 if progs:
                     self.island_best_programs[i] = max(
                         progs,
@@ -750,7 +756,7 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
         for i, island in enumerate(self.islands):
             if not island:
                 continue
-            island_progs = [self.programs[pid] for pid in island if pid in self.programs]
+            island_progs = [self.programs[pid] for pid in sorted(island) if pid in self.programs]
             if not island_progs:
                 continue
 
@@ -775,7 +781,9 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
                 for target in targets:
                     # Skip if target island already has identical solution
                     target_progs = [
-                        self.programs[pid] for pid in self.islands[target] if pid in self.programs
+                        self.programs[pid]
+                        for pid in sorted(self.islands[target])
+                        if pid in self.programs
                     ]
                     if any(p.solution == migrant.solution for p in target_progs):
                         continue
@@ -880,7 +888,7 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
                     self.programs[pid].metadata["island"] = island_idx
 
         # Clean stale refs from archive and feature maps
-        self.archive = {pid for pid in self.archive if pid in self.programs}
+        self.archive = {pid for pid in sorted(self.archive) if pid in self.programs}
         for imap in self.island_feature_maps:
             for k in [k for k, pid in imap.items() if pid not in self.programs]:
                 del imap[k]
@@ -943,7 +951,7 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
 
     def _log_island_status(self) -> None:
         for i, island in enumerate(self.islands):
-            progs = [self.programs[pid] for pid in island if pid in self.programs]
+            progs = [self.programs[pid] for pid in sorted(island) if pid in self.programs]
             if progs:
                 scores = [_get_fitness(p.metrics, self.feature_dimensions) for p in progs]
                 best, avg = max(scores), sum(scores) / len(scores)
@@ -961,3 +969,15 @@ class OpenEvolveNativeDatabase(ProgramDatabase):
                 avg,
                 " [current]" if i == self.current_island else "",
             )
+
+
+class InMemoryOpenEvolveNativeProgramDatabase(
+    OpenEvolveNativeDatabaseMethods, InMemoryProgramDatabase
+):
+    """OpenEvolveNative selection with in-memory storage."""
+
+    pass
+
+
+# Preserve the existing import path.
+OpenEvolveNativeDatabase = InMemoryOpenEvolveNativeProgramDatabase

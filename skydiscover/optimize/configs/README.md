@@ -353,3 +353,13 @@ uv run skydiscover optimize initial_program.py evaluator.py \
   --model gemini/gemini-3-pro-preview \
   -i 50
 ```
+
+## PostgreSQL backend
+
+Native Optimize supports `search.database.backend: postgres`, with a connection
+string in `search.database.postgres_dsn` or `SKYDISCOVER_POSTGRES_DSN`. Install
+`uv sync --extra postgres`, then run `uv run skydiscover db migrate`. Durable runs
+print a run ID; use `--resume RUN_ID` with the same search configuration.
+PostgreSQL does not use file checkpoints. See
+[PostgreSQL runs](../../../docs/content/docs/optimize/postgres.mdx) for setup and
+recovery details.

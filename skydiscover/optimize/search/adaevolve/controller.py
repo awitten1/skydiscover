@@ -247,6 +247,8 @@ class AdaEvolveController(DiscoveryController):
                 logger.info("Shutdown requested")
                 break
 
+            if self.database.is_iteration_complete(iteration):
+                continue
             try:
                 await self._run_iteration(iteration, checkpoint_callback)
             except Exception as e:
@@ -254,7 +256,8 @@ class AdaEvolveController(DiscoveryController):
             finally:
                 # CRITICAL: Tell database iteration is complete
                 # This handles island rotation (UCB) and migration
-                self.database.end_iteration(iteration)
+                if not self.database.durable:
+                    self.database.end_iteration(iteration)
 
         logger.info("AdaEvolve completed")
         self.database.log_status()
@@ -312,6 +315,10 @@ class AdaEvolveController(DiscoveryController):
 
         if result.error:
             logger.warning(f"Iteration {iteration}: {result.error}")
+            if self.database.durable:
+                with self.database.operation():
+                    self.database.end_iteration(iteration)
+                    self._complete_iteration(iteration, result.error, result)
             # Log failed iteration stats
             self._log_iteration_stats(
                 iteration=iteration,
@@ -324,7 +331,11 @@ class AdaEvolveController(DiscoveryController):
                 error=result.error,
             )
         else:
-            self._process_result(result, iteration, checkpoint_callback)
+            with self.database.operation():
+                self._process_result(result, iteration, checkpoint_callback)
+                if self.database.durable:
+                    self.database.end_iteration(iteration)
+                    self._complete_iteration(iteration, result=result)
             # Log successful iteration stats
             self._log_iteration_stats(
                 iteration=iteration,
@@ -471,14 +482,15 @@ class AdaEvolveController(DiscoveryController):
     ) -> SerializableResult:
         """Generate and evaluate a single child program."""
         try:
-            if not self.database.programs:
+            if not self.database.has_programs():
                 return await self._run_from_scratch_iteration(iteration)
 
             # Ensure all islands are seeded (needed after from-scratch bootstrap)
             self._ensure_all_islands_seeded()
 
             # Sample parent and context programs (database returns standard framework dicts)
-            parent_dict, context_programs_dict = self.database.sample(
+            parent_dict, context_programs_dict = self.database.sample_for_iteration(
+                iteration,
                 self.num_context_programs,
                 force_exploration=force_exploration,
             )

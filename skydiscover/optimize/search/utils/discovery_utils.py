@@ -77,6 +77,7 @@ def load_database_from_file(
     file_path: str,
     database_class_name: str = "EvolvedProgramDatabase",
     program_class_name: str = "EvolvedProgram",
+    backend: str = "memory",
 ) -> Tuple[Type[ProgramDatabase], Type[Program]]:
     """Dynamically load database and program classes from a Python file."""
     if not os.path.isfile(file_path):
@@ -84,7 +85,10 @@ def load_database_from_file(
 
     import hashlib
 
-    module_name = f"custom_database_{hashlib.md5(file_path.encode()).hexdigest()[:16]}"
+    source = Path(file_path).read_text()
+    if backend not in ("memory", "postgres"):
+        raise ValueError(f"Unknown database backend: {backend}")
+    module_name = "custom_database_" + hashlib.sha256((source + backend).encode()).hexdigest()[:16]
 
     if module_name not in sys.modules:
         spec = importlib.util.spec_from_file_location(module_name, file_path)
@@ -96,7 +100,52 @@ def load_database_from_file(
         sys.modules[module_name] = module
 
         try:
-            spec.loader.exec_module(module)
+            # Generated strategies inherit the selected storage backend. Keep
+            # their Program import and method bodies unchanged, including super().
+            import ast
+
+            tree = ast.parse(source, filename=file_path)
+
+            class BackendImports(ast.NodeTransformer):
+                def visit_ImportFrom(self, node):
+                    if node.module not in (
+                        "skydiscover.optimize.search.base_database",
+                        "skydiscover.search.base_database",
+                        "skydiscover.optimize.search.in_memory_database",
+                        "skydiscover.optimize.search.postgres_database",
+                    ):
+                        return node
+                    storage = [
+                        n
+                        for n in node.names
+                        if n.name
+                        in ("ProgramDatabase", "InMemoryProgramDatabase", "PostgresProgramDatabase")
+                    ]
+                    if not storage:
+                        return node
+                    other = [n for n in node.names if n not in storage]
+                    target_module = f"skydiscover.optimize.search.{ 'postgres_database' if backend == 'postgres' else 'in_memory_database'}"
+                    target_name = (
+                        "PostgresProgramDatabase"
+                        if backend == "postgres"
+                        else "InMemoryProgramDatabase"
+                    )
+                    imports = [
+                        ast.ImportFrom(
+                            module=target_module,
+                            names=[ast.alias(name=target_name, asname=n.asname or n.name)],
+                            level=0,
+                        )
+                        for n in storage
+                    ]
+                    if other:
+                        imports.insert(
+                            0, ast.ImportFrom(module=node.module, names=other, level=node.level)
+                        )
+                    return imports
+
+            tree = ast.fix_missing_locations(BackendImports().visit(tree))
+            exec(compile(tree, file_path, "exec"), module.__dict__)
         except Exception as e:
             del sys.modules[module_name]
             raise ValueError(f"Error executing {file_path}: {e}") from e
@@ -115,6 +164,12 @@ def load_database_from_file(
             f"{database_class_name} must extend ProgramDatabase, {program_class_name} must extend Program"
         )
 
+    from skydiscover.optimize.search.persistence.operations import database_operation
+
+    # Generated public methods follow the same transaction boundary as native ones.
+    for name, method in list(vars(database_class).items()):
+        if callable(method) and not name.startswith("_") and name not in ("save", "load"):
+            setattr(database_class, name, database_operation(method))
     return database_class, program_class
 
 

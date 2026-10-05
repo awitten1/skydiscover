@@ -1,0 +1,109 @@
+---
+title: PostgreSQL runs
+description: Durable native Optimize runs without file checkpoints.
+---
+
+Optimize defaults to an in-memory program database. Select PostgreSQL to retain
+candidates, metrics, lineage, prompts, artifacts, RNG state, and search state in
+one database. The backend supports Top-K, Best-of-N, beam search, AdaEvolve,
+OpenEvolve Native, GEPA Native, Claude Code, and EvoX (including its meta search).
+Synthesize and third-party search engines are unchanged.
+
+Install the optional driver:
+
+```bash
+uv sync --extra postgres
+```
+
+For local development, a PostgreSQL 16 instance with a persistent Docker volume
+is provided:
+
+```bash
+docker compose -f compose.postgres.yaml up -d --wait
+export SKYDISCOVER_POSTGRES_DSN='postgresql://skydiscover:skydiscover@localhost:55433/skydiscover'
+uv run skydiscover db migrate
+```
+
+The credentials above are for this local development instance. Use your own
+connection settings for an existing database. Migration is explicit; opening a
+run never creates algorithm-specific tables.
+
+Add the backend to the existing configuration, retaining its other settings:
+
+```yaml
+search:
+  type: best_of_n
+  database:
+    backend: postgres
+    best_of_n: 5
+```
+
+`postgres_dsn` can also be set under `search.database`. An omitted DSN uses
+`SKYDISCOVER_POSTGRES_DSN`. The connection string is excluded from stored run
+configuration. Memory remains the default when `backend` is omitted.
+
+Run the text similarity example with your edited configuration:
+
+```bash
+uv run skydiscover optimize \
+  skydiscover/optimize/examples/text_similarity/initial_program.py \
+  skydiscover/optimize/examples/text_similarity/evaluator/ \
+  --config skydiscover/optimize/examples/text_similarity/config.yaml
+```
+
+The runner prints a run ID and saves it to `run_id.json` in the output directory.
+Resume with the same evaluator and search configuration:
+
+```bash
+uv run skydiscover optimize \
+  skydiscover/optimize/examples/text_similarity/initial_program.py \
+  skydiscover/optimize/examples/text_similarity/evaluator/ \
+  --config skydiscover/optimize/examples/text_similarity/config.yaml \
+  --resume RUN_ID
+```
+
+`--iterations` specifies how many additional iterations to run. The database
+remembers completed iterations, including failures and rejections, and does not
+skip incomplete iterations when parallel work finishes out of order. Saved
+parent/context selections are reused for unfinished work. Model calls and
+evaluations without a committed result may be repeated after a crash.
+
+PostgreSQL runs never write or load file checkpoints. `checkpoint_interval` has
+no effect for this backend; `--checkpoint` is rejected. Final solution exports
+and logs still go to the output directory. Existing memory checkpoint helpers
+remain available for compatibility, without importing those checkpoints into
+PostgreSQL.
+
+Only one process may open a run at a time. A session advisory lock lasts through
+model and evaluator calls; the process releases it when the runner finishes or
+its database connection closes. Internal parallel iterations use this same
+connection and short transactions. Different runs may execute concurrently.
+
+All PostgreSQL algorithm subclasses share the same schema. Search state is
+versioned JSONB, and candidate records are shared across EvoX strategy revisions.
+Population eviction retains candidate history. The PostgreSQL backend uses SQL
+for candidate lookup and ranking. Native algorithms reuse their existing
+selection calculations over SQL-backed population views. Runtime archive state
+is reconstructed from the database at each operation; it is not an authoritative
+mirror of candidate storage. Generated EvoX strategies must use JSON-compatible
+state (plus the supported native archive/adaptation data structures).
+
+Claude Code resumes by starting a new CLI session from the stored best solution;
+saved snapshots retain the acknowledged turn count. Its live CLI session is not
+a database record.
+
+The Python API accepts `resume=RUN_ID`, and `DiscoveryResult.run_id` identifies
+the durable run. A directly constructed database holds its lock until `close()`.
+
+Replay a durable run in the monitor without acquiring its writer lock:
+
+```bash
+uv run skydiscover viewer RUN_ID --postgres-dsn "$SKYDISCOVER_POSTGRES_DSN"
+```
+
+To run the database integration tests:
+
+```bash
+SKYDISCOVER_TEST_POSTGRES_DSN="$SKYDISCOVER_POSTGRES_DSN" \
+  uv run pytest tests/search/test_postgres_database.py
+```

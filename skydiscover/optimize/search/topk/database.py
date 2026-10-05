@@ -3,17 +3,20 @@ from typing import List, Optional, Tuple
 
 from skydiscover.optimize.config import DatabaseConfig
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
+from skydiscover.optimize.search.in_memory_database import InMemoryProgramDatabase
+from skydiscover.optimize.search.persistence.operations import database_operation
 
 logger = logging.getLogger(__name__)
 
 
-class TopKDatabase(ProgramDatabase):
+class TopKDatabaseMethods(ProgramDatabase):
     """Database for top-k programs"""
 
     def __init__(self, name: str, config: DatabaseConfig):
         super().__init__(name, config)
         self.initial_program = None
 
+    @database_operation
     def add(self, program: Program, iteration: Optional[int] = None, **kwargs) -> str:
         """Add a program to the database (minimal Top-K)."""
         # Store the initial program
@@ -38,6 +41,7 @@ class TopKDatabase(ProgramDatabase):
         logger.debug(f"Added program {program.id} to top-k database")
         return program.id
 
+    @database_operation
     def sample(
         self, num_context_programs: Optional[int] = 4, **kwargs
     ) -> Tuple[Program, List[Program]]:
@@ -86,3 +90,13 @@ class TopKDatabase(ProgramDatabase):
             )
 
         return parent, context_programs
+
+
+class InMemoryTopKProgramDatabase(TopKDatabaseMethods, InMemoryProgramDatabase):
+    """TopK selection with in-memory storage."""
+
+    pass
+
+
+# Preserve the existing import path.
+TopKDatabase = InMemoryTopKProgramDatabase

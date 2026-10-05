@@ -1,5 +1,12 @@
 {
   "title": "Optimize",
   "defaultOpen": true,
-  "pages": ["index", "quick-start", "evaluators", "configuration", "benchmarks"]
+  "pages": [
+    "index",
+    "quick-start",
+    "evaluators",
+    "configuration",
+    "postgres",
+    "benchmarks"
+  ]
 }
