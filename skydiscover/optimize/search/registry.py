@@ -76,6 +76,8 @@ def create_database(search_type: str, config: DatabaseConfig) -> ProgramDatabase
         raise ValueError(f"Unknown database backend: {config.backend}")
     if config.run_id and config.backend != "postgres":
         raise ValueError("Run ID resume requires the PostgreSQL backend")
+    if (config.task_id or config.task_name) and config.backend != "postgres":
+        raise ValueError("Tasks require the PostgreSQL backend")
     if search_type in ("evox", "evolve") and getattr(config, "database_file_path", None):
         import tempfile
         from pathlib import Path
@@ -235,6 +237,18 @@ def setup_search(
 
     if not output_dir:
         output_dir = build_output_dir(config.search.type, initial_program_path)
+
+    if database.durable:
+        from skydiscover.optimize.search.persistence.inputs import capture_inputs
+
+        try:
+            inputs = capture_inputs(config, evaluation_file, output_dir, evaluator_env_vars)
+            database.store_inputs(
+                *inputs, initial_program_solution, os.path.basename(initial_program_path)
+            )
+        except BaseException:
+            database.close()
+            raise
 
     controller_input = DiscoveryControllerInput(
         config=config,

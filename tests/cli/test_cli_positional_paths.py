@@ -32,3 +32,16 @@ def test_parse_args_rejects_more_than_two_paths(monkeypatch):
         parse_args()
 
     assert exc_info.value.code == 2
+
+
+def test_stored_task_accepts_evaluator_and_optional_seed():
+    args = parse_args(["eval.py", "--task", "task-id", "--initial-program", "seed.py"])
+    assert args.task == "task-id"
+    assert args.evaluation_file == "eval.py"
+    assert args.initial_program == "seed.py"
+    assert args.config is None
+
+
+def test_task_and_resume_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        parse_args(["--task", "task-id", "--resume", "run-id"])

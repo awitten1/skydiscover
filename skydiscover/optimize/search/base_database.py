@@ -85,6 +85,7 @@ class ProgramDatabase(ABC):
 
     durable = False
     run_id: Optional[str] = None
+    task_id: Optional[str] = None
     language: str
     last_iteration: int
     initial_program_id: Optional[str]
@@ -145,6 +146,9 @@ class ProgramDatabase(ABC):
 
     def save_controller_state(self, state):
         pass
+
+    def store_inputs(self, config, assets, starting_solution, starting_filename):
+        raise NotImplementedError("Durable run inputs require a persistent backend")
 
     def save(self, *args, **kwargs):
         raise NotImplementedError

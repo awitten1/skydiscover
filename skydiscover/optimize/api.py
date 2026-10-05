@@ -50,6 +50,7 @@ class DiscoveryResult:
     output_dir: Optional[str]
     initial_score: Optional[float] = None
     run_id: Optional[str] = None
+    task_id: Optional[str] = None
 
     def __repr__(self) -> str:
         init = f"{self.initial_score:.4f}" if self.initial_score is not None else "N/A"
@@ -57,7 +58,7 @@ class DiscoveryResult:
 
 
 def run_discovery(
-    evaluator: Union[str, Path, Callable],
+    evaluator: Optional[Union[str, Path, Callable]] = None,
     initial_program: Optional[Union[str, Path, List[str]]] = None,
     model: Optional[str] = None,
     iterations: Optional[int] = None,
@@ -69,6 +70,8 @@ def run_discovery(
     api_base: Optional[str] = None,
     cleanup: bool = True,
     resume: Optional[str] = None,
+    task_id: Optional[str] = None,
+    postgres_dsn: Optional[str] = None,
 ) -> DiscoveryResult:
     """Run a discovery process and return the best result.
 
@@ -86,6 +89,8 @@ def run_discovery(
         api_base: Base URL for an OpenAI-compatible API.
         cleanup: Remove temp files after the run.
         resume: PostgreSQL run ID to continue with the same search configuration.
+        task_id: Existing PostgreSQL task ID for a new run using its stored defaults.
+        postgres_dsn: Connection string; defaults to SKYDISCOVER_POSTGRES_DSN.
 
     Returns:
         DiscoveryResult with best program, score, solution, metrics, and output directory.
@@ -104,13 +109,15 @@ def run_discovery(
             system_prompt=system_prompt,
             api_base=api_base,
             resume=resume,
+            task_id=task_id,
+            postgres_dsn=postgres_dsn,
         )
     )
 
 
 async def _run_discovery_async(
     initial_program: Optional[Union[str, Path, List[str]]],
-    evaluator: Union[str, Path, Callable],
+    evaluator: Optional[Union[str, Path, Callable]],
     config: Union[str, Path, Config, None],
     *,
     model: Optional[str] = None,
@@ -122,15 +129,26 @@ async def _run_discovery_async(
     api_base: Optional[str] = None,
     cleanup: bool = True,
     resume: Optional[str] = None,
+    task_id: Optional[str] = None,
+    postgres_dsn: Optional[str] = None,
 ) -> DiscoveryResult:
     """Async implementation of run_discovery."""
 
     temp_dir: Optional[str] = None
     temp_files: List[str] = []
-    evaluator_env_vars: Dict[str, str] = {}
+    evaluator_env_vars: Optional[Dict[str, str]] = None
 
     try:
-        if isinstance(config, Config):
+        if config is None and (resume or task_id):
+            from skydiscover.optimize.search.persistence.inputs import (
+                read_inputs,
+                restore_configuration,
+            )
+
+            dsn = postgres_dsn or os.environ.get("SKYDISCOVER_POSTGRES_DSN")
+            payload = read_inputs(dsn, run_id=resume, task_id=None if resume else task_id)
+            config_obj = restore_configuration(payload, dsn)
+        elif isinstance(config, Config):
             config_obj = config
         else:
             config_obj = load_config(str(config) if config else None)
@@ -145,7 +163,12 @@ async def _run_discovery_async(
         )
 
         # Resolve benchmark problem if configured and no initial_program provided
-        if initial_program is None and config_obj.benchmark and config_obj.benchmark.enabled:
+        if (
+            not (resume or task_id)
+            and initial_program is None
+            and config_obj.benchmark
+            and config_obj.benchmark.enabled
+        ):
             try:
                 resolution = resolve_benchmark_problem(config_obj.benchmark)
                 initial_program = resolution.initial_program_path
@@ -168,7 +191,9 @@ async def _run_discovery_async(
             config_obj.agentic.codebase_root = os.path.dirname(os.path.abspath(program_path))
 
         # Prepare the evaluator
-        evaluator_path = prepare_evaluator(evaluator, temp_dir, temp_files)
+        evaluator_path = (
+            prepare_evaluator(evaluator, temp_dir, temp_files) if evaluator is not None else None
+        )
 
         # Prepare the output directory
         search_type = (
@@ -254,6 +279,8 @@ async def _run_discovery_async(
             output_dir=actual_output_dir,
             evaluator_env_vars=evaluator_env_vars,
             resume=resume,
+            task_id=task_id,
+            postgres_dsn=postgres_dsn,
         )
 
         best_program = await controller.run(iterations=iterations)
@@ -278,6 +305,7 @@ async def _run_discovery_async(
             output_dir=actual_output_dir if not cleanup else None,
             initial_score=initial_score,
             run_id=controller.run_id,
+            task_id=controller.task_id,
         )
 
     finally:

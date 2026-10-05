@@ -1,10 +1,13 @@
+import copy
 import json
 import logging
 import os
 import signal
 import sys
+import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from skydiscover.optimize.config import Config, build_output_dir, load_config
@@ -35,28 +38,87 @@ class Runner:
         config: optional pre-built Config object (takes priority over config_path).
         output_dir: where to write logs, checkpoints, and best program.
             Auto-generated from search type + problem name if omitted.
+        resume: PostgreSQL run ID; loads config and original seed from the database.
+        task_id: PostgreSQL task ID for a new run using stored task defaults.
+        postgres_dsn: Connection string, or use SKYDISCOVER_POSTGRES_DSN.
     """
 
     def __init__(
         self,
-        evaluation_file: str,
+        evaluation_file: Optional[str] = None,
         initial_program_path: Optional[str] = None,
         config_path: Optional[str] = None,
         config: Optional[Config] = None,
         output_dir: Optional[str] = None,
         evaluator_env_vars: Optional[dict[str, str]] = None,
         resume: Optional[str] = None,
+        task_id: Optional[str] = None,
+        postgres_dsn: Optional[str] = None,
     ):
-        self.config = config if config is not None else load_config(config_path)
-        if resume:
-            import copy
+        from skydiscover.optimize.search.persistence.inputs import (
+            capture_inputs,
+            materialize_inputs,
+            read_inputs,
+            restore_configuration,
+        )
 
-            # A resume argument must not turn the caller's reusable config into
-            # a permanent reference to this run.
-            self.config = copy.copy(self.config)
-            self.config.search = copy.copy(self.config.search)
-            self.config.search.database = copy.copy(self.config.search.database)
+        supplied = (
+            config if config is not None else load_config(config_path) if config_path else None
+        )
+        resume = resume or (supplied.search.database.run_id if supplied else None)
+        task_id = task_id or (supplied.search.database.task_id if supplied else None)
+        if resume and task_id and supplied is None:
+            raise ValueError("Specify a run to resume or a task for a new run")
+        dsn = postgres_dsn or (supplied.search.database.postgres_dsn if supplied else None)
+        dsn = dsn or os.environ.get("SKYDISCOVER_POSTGRES_DSN")
+        self._input_workspace = None
+        if resume or task_id:
+            payload = read_inputs(dsn, run_id=resume, task_id=None if resume else task_id)
+            if resume and task_id and task_id != payload["task_id"]:
+                raise ValueError("Task ID differs from the stored run")
+            self.config = (
+                copy.deepcopy(supplied) if supplied else restore_configuration(payload, dsn)
+            )
+            self._input_workspace = tempfile.TemporaryDirectory(prefix="skydiscover-inputs-")
+            stored_evaluator, stored_env = materialize_inputs(
+                payload, self._input_workspace.name, self.config
+            )
+            evaluation_file = evaluation_file or stored_evaluator
+            evaluator_env_vars = (
+                evaluator_env_vars if evaluator_env_vars is not None else stored_env
+            )
+            if resume:
+                if initial_program_path and (
+                    Path(initial_program_path).read_text() != payload["starting_solution"]
+                ):
+                    raise ValueError(
+                        "A resumed run keeps its starting solution; start a new task run to change it"
+                    )
+                initial_program_path = None
+                if payload["starting_solution"] is not None:
+                    seed = (
+                        Path(self._input_workspace.name)
+                        / "initial"
+                        / Path(payload["starting_filename"] or "initial.py").name
+                    )
+                    seed.parent.mkdir(parents=True, exist_ok=True)
+                    seed.write_text(payload["starting_solution"])
+                    initial_program_path = str(seed)
+            self.config.search.database.backend = "postgres"
+            self.config.search.database.postgres_dsn = dsn
             self.config.search.database.run_id = resume
+            self.config.search.database.task_id = payload["task_id"]
+        else:
+            self.config = supplied or load_config()
+            if postgres_dsn:
+                self.config = copy.deepcopy(self.config)
+                self.config.search.database.backend = "postgres"
+                self.config.search.database.postgres_dsn = postgres_dsn
+        evaluation_file = evaluation_file or self.config.evaluator.evaluation_file
+        if not evaluation_file or not os.path.exists(evaluation_file):
+            raise ValueError(
+                "Provide an existing evaluator path; evaluators remain external to PostgreSQL"
+            )
         self.name = self.config.search.type
         self.output_dir = output_dir or build_output_dir(
             self.name, initial_program_path or "scratch"
@@ -81,15 +143,6 @@ class Runner:
         if self.config.file_suffix == ".py":
             self.config.file_suffix = self.file_extension
 
-        # Create the database
-        self.database = create_database(self.config.search.type, self.config.search.database)
-        self.run_id = self.database.run_id
-        with self.database.operation():
-            self.database.language = self.config.language or "python"
-        if self.run_id:
-            logger.info("PostgreSQL run ID: %s", self.run_id)
-            with open(os.path.join(self.output_dir, "run_id.json"), "w") as f:
-                json.dump({"run_id": self.run_id}, f)
         self.evaluation_file = evaluation_file
         self.evaluator_env_vars = dict(evaluator_env_vars or {})
 
@@ -104,6 +157,35 @@ class Runner:
             self.config.evaluator.inject_evaluator_context = (
                 initial_program_path is None or _is_harbor_task(evaluation_file)
             )
+
+        inputs = None
+        if self.config.search.database.backend == "postgres":
+            inputs = capture_inputs(
+                self.config, self.evaluation_file, self.output_dir, self.evaluator_env_vars
+            )
+        self.database = create_database(self.config.search.type, self.config.search.database)
+        self.run_id = self.database.run_id
+        self.task_id = self.database.task_id
+        try:
+            with self.database.operation():
+                self.database.language = self.config.language or "python"
+                if inputs:
+                    self.database.store_inputs(
+                        inputs[0],
+                        inputs[1],
+                        self.initial_program_solution,
+                        os.path.basename(initial_program_path) if initial_program_path else None,
+                    )
+        except BaseException:
+            self.database.close()
+            if self._input_workspace:
+                self._input_workspace.cleanup()
+            raise
+        if self.run_id:
+            logger.info("PostgreSQL task ID: %s", self.task_id)
+            logger.info("PostgreSQL run ID: %s", self.run_id)
+            with open(os.path.join(self.output_dir, "run_id.json"), "w") as f:
+                json.dump({"run_id": self.run_id, "task_id": self.task_id}, f)
 
         # Initialize the discovery controller
         self.discovery_controller: Optional[DiscoveryController] = None
@@ -166,6 +248,8 @@ class Runner:
                     self._initial_score_cached = self.initial_score
                 finally:
                     self.database.close()
+                    if self._input_workspace:
+                        self._input_workspace.cleanup()
 
     async def _run(
         self,

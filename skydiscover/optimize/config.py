@@ -398,6 +398,8 @@ class DatabaseConfig:
         default_factory=lambda: os.environ.get("SKYDISCOVER_POSTGRES_DSN"), repr=False
     )
     run_id: Optional[str] = None
+    task_id: Optional[str] = None
+    task_name: Optional[str] = None
     db_path: Optional[str] = None
     log_prompts: bool = True
     # RNG seed for reproducible selection. None (the default) draws from OS entropy,
@@ -914,6 +916,11 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> Config:
     else:
         config = Config()
 
+    return resolve_config(config)
+
+
+def resolve_config(config: Config) -> Config:
+    """Resolve runtime credentials and model defaults for a loaded configuration."""
     # Update api_base from environment if provided — use overwrite=True
     # because __post_init__ already pushed the hardcoded default to all models.
     api_base = os.environ.get("OPENAI_API_BASE") or os.environ.get("OPENAI_BASE_URL")

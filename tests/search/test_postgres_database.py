@@ -47,12 +47,15 @@ def dsn():
 def databases(dsn):
     opened = []
     runs = set()
+    tasks = set()
 
     def create(cls=TopKPostgresProgramDatabase, cfg=None, name="topk"):
         cfg = cfg or DatabaseConfig(backend="postgres", postgres_dsn=dsn, random_seed=42)
         db = cls(name, cfg)
         opened.append(db)
         runs.add(db.run_id)
+        if cfg.task_id is None:
+            tasks.add(db.task_id)
         return db
 
     yield create
@@ -61,6 +64,8 @@ def databases(dsn):
     with connect(dsn) as conn:
         for run in runs:
             conn.execute("DELETE FROM skydiscover.runs WHERE id=%s", (run,))
+        for task in tasks:
+            conn.execute("DELETE FROM skydiscover.tasks WHERE id=%s", (task,))
 
 
 def program(pid, score, iteration=0, parent=None):
@@ -119,10 +124,12 @@ def test_state_and_selection_survive_reopen(databases, dsn, cls, config_cls, nam
     )
     best = db.get_best_program().id
     run_id = db.run_id
+    task_id = db.task_id
     db.close()
     resume_cfg = copy.copy(cfg)
     resume_cfg.run_id = run_id
     resumed = databases(cls, resume_cfg, name)
+    assert resumed.task_id == task_id
     assert resumed.get_best_program().id == best
     assert normalized(resumed.sample_for_iteration(1, 2)) == selection
     assert resumed.get_prompts("p5")["generation"]["responses"] == ["response"]
@@ -203,6 +210,62 @@ def test_attempt_parent_must_belong_to_same_run(databases):
     ).fetchone() == (None,)
 
 
+def test_task_can_group_runs_with_independent_solutions(databases, dsn):
+    cfg = DatabaseConfig(backend="postgres", postgres_dsn=dsn, task_name="text similarity")
+    a = databases(cfg=cfg)
+    b = databases(
+        BestOfNPostgresProgramDatabase,
+        BestOfNDatabaseConfig(backend="postgres", postgres_dsn=dsn, task_id=a.task_id),
+        "best_of_n",
+    )
+    assert a.run_id != b.run_id
+    assert a.task_id == b.task_id
+    assert cfg.task_id is None
+    a.add(program("seed", 1))
+    b.add(program("seed", 2))
+    assert a.get("seed").solution != b.get("seed").solution
+    a.add(program("only-a", 3))
+    assert b.get("only-a") is None
+    assert a._conn.execute(
+        "SELECT name FROM skydiscover.tasks WHERE id=%s", (a.task_id,)
+    ).fetchone() == ("text similarity",)
+    assert a._conn.execute(
+        "SELECT count(*) FROM skydiscover.runs WHERE task_id=%s", (a.task_id,)
+    ).fetchone() == (2,)
+    a.close()
+    resumed = databases(cfg=DatabaseConfig(backend="postgres", postgres_dsn=dsn, run_id=a.run_id))
+    assert resumed.task_id == b.task_id
+    assert resumed.get("seed").metrics["combined_score"] == 1
+
+
+def test_unknown_task_and_resume_task_mismatch_are_rejected(databases, dsn):
+    from psycopg.errors import ForeignKeyViolation
+
+    a, b = databases(), databases()
+    unknown_id = str(uuid.uuid4())
+    with pytest.raises(ValueError, match="Unknown task ID"):
+        databases(cfg=DatabaseConfig(backend="postgres", postgres_dsn=dsn, task_id=unknown_id))
+    with pytest.raises(ForeignKeyViolation):
+        a._conn.execute(
+            "INSERT INTO skydiscover.runs(id,task_id,search_type,database_config) VALUES (%s,%s,'topk','{}')",
+            (str(uuid.uuid4()), unknown_id),
+        )
+    a.close()
+    with pytest.raises(ValueError, match="Task ID differs"):
+        databases(
+            cfg=DatabaseConfig(
+                backend="postgres",
+                postgres_dsn=dsn,
+                random_seed=42,
+                run_id=a.run_id,
+                task_id=b.task_id,
+            )
+        )
+    assert b._conn.execute(
+        "SELECT task_id FROM skydiscover.runs WHERE id=%s", (a.run_id,)
+    ).fetchone()[0] == uuid.UUID(a.task_id)
+
+
 def test_parallel_completion_does_not_skip_holes(databases):
     db = databases()
     db.complete_iteration(0)
@@ -266,8 +329,8 @@ def test_schema_is_identical_for_every_algorithm(databases):
         "programs",
         "prompts",
         "runs",
-        "schema_version",
         "strategies",
+        "tasks",
     ]
 
 
@@ -368,12 +431,17 @@ async def test_runner_uses_postgres_without_checkpoints(dsn, tmp_path, monkeypat
     cfg.evaluator.cascade_evaluation = False
     runner = Runner(str(evaluator), str(seed), config=cfg, output_dir=str(tmp_path / "first"))
     run_id = runner.run_id
+    other = None
     try:
         best = await runner.run(iterations=2)
         assert best.metrics["combined_score"] == 2
         assert best.metrics["test_combined_score"] == 2
         assert not (tmp_path / "first" / "checkpoints").exists()
         assert runner.initial_score == 1
+        import json
+
+        ids = json.loads((tmp_path / "first" / "run_id.json").read_text())
+        assert ids == {"run_id": run_id, "task_id": runner.task_id}
         resumed = Runner(
             str(evaluator),
             str(seed),
@@ -382,15 +450,37 @@ async def test_runner_uses_postgres_without_checkpoints(dsn, tmp_path, monkeypat
             resume=run_id,
         )
         assert cfg.search.database.run_id is None
+        assert resumed.task_id == runner.task_id
         assert resumed.database.next_iteration == 3
         assert resumed.database.get_best_program().metrics["test_combined_score"] == 2
         best = await resumed.run(iterations=1)
         assert best.metrics["combined_score"] == 2
         assert not (tmp_path / "resumed" / "checkpoints").exists()
+        other_seed = tmp_path / "other_initial.py"
+        other_seed.write_text("def solution():\n    return 7\n")
+        other_cfg = copy.deepcopy(cfg)
+        other_cfg.search.database.task_id = runner.task_id
+        other = Runner(
+            str(evaluator),
+            str(other_seed),
+            config=other_cfg,
+            output_dir=str(tmp_path / "other"),
+        )
+        assert other.run_id != run_id
+        assert other.task_id == runner.task_id
+        await other.run(iterations=0)
+        assert other.initial_score == 7
+        assert runner.initial_score == 1
+        assert other.database.initial_program_id != runner.database.initial_program_id
     finally:
         runner.database.close()
+        if other:
+            other.database.close()
         with connect(dsn) as conn:
             conn.execute("DELETE FROM skydiscover.runs WHERE id=%s", (run_id,))
+            if other:
+                conn.execute("DELETE FROM skydiscover.runs WHERE id=%s", (other.run_id,))
+            conn.execute("DELETE FROM skydiscover.tasks WHERE id=%s", (runner.task_id,))
 
 
 def test_nonfinite_metrics_and_binary_artifacts(databases):
@@ -513,7 +603,11 @@ def test_claude_snapshots_persist_turn_progress(databases):
 
 @pytest.mark.asyncio
 async def test_evox_controller_resume_preserves_meta_run_and_window(dsn, tmp_path, monkeypatch):
+    import shutil
+    from pathlib import Path
+
     from skydiscover.optimize.config import Config, EvoxDatabaseConfig, LLMModelConfig, SearchConfig
+    from skydiscover.optimize.llm import llm_pool
     from skydiscover.optimize.llm.base import LLMResponse
     from skydiscover.optimize.llm.llm_pool import LLMPool
     from skydiscover.optimize.runner import Runner
@@ -533,6 +627,7 @@ async def test_evox_controller_resume_preserves_meta_run_and_window(dsn, tmp_pat
     monkeypatch.setattr(LLMPool, "generate", generate)
     monkeypatch.setattr(LLMPool, "check_availability", availability)
     monkeypatch.setattr(CoEvolutionController, "_generate_variation_operators", labels)
+    monkeypatch.setattr(llm_pool, "OpenAILLM", lambda cfg: object())
     seed = tmp_path / "initial.py"
     seed.write_text("def solution():\n    return 1\n")
     evaluator = tmp_path / "evaluator.py"
@@ -540,6 +635,12 @@ async def test_evox_controller_resume_preserves_meta_run_and_window(dsn, tmp_pat
         'import runpy\ndef evaluate(program_path):\n    return {"combined_score": runpy.run_path(program_path)["solution"]()}\n'
     )
     db_cfg = EvoxDatabaseConfig(backend="postgres", postgres_dsn=dsn, random_seed=42)
+    original_inputs = tmp_path / "original_strategy"
+    shutil.copytree(Path(db_cfg.database_file_path).parent, original_inputs / "database")
+    shutil.copytree(Path(db_cfg.config_path).parent, original_inputs / "config")
+    db_cfg.database_file_path = str(original_inputs / "database" / "initial_search_strategy.py")
+    db_cfg.evaluation_file = str(original_inputs / "database" / "search_strategy_evaluator.py")
+    db_cfg.config_path = str(original_inputs / "config" / "search.yaml")
     cfg = Config(
         search=SearchConfig(type="evox", database=db_cfg, switch_interval=100, share_llm=True),
         diff_based_generation=False,
@@ -553,12 +654,13 @@ async def test_evox_controller_resume_preserves_meta_run_and_window(dsn, tmp_pat
     try:
         best = await runner.run(iterations=2)
         assert best.metrics["combined_score"] == 2
+        shutil.rmtree(original_inputs)
+        seed.unlink()
         resumed = Runner(
             str(evaluator),
-            str(seed),
-            config=cfg,
             output_dir=str(tmp_path / "second"),
             resume=run_id,
+            postgres_dsn=dsn,
         )
         state = resumed.database.get_controller_state()
         meta_run = state["meta_run_id"]
@@ -570,6 +672,9 @@ async def test_evox_controller_resume_preserves_meta_run_and_window(dsn, tmp_pat
 
         resume_cfg = copy.copy(db_cfg)
         resume_cfg.run_id = run_id
+        # Reopen the active strategy from PostgreSQL without depending on the
+        # now-removed input tree or the cleaned-up resume workspace.
+        resume_cfg.database_file_path = EvoxDatabaseConfig().database_file_path
         reopened = create_database("evox", resume_cfg)
         try:
             state = reopened.get_controller_state()
@@ -610,3 +715,261 @@ def test_boolean_score_retains_its_value_and_can_be_ranked(databases):
     db.add(program("correct", True))
     assert db.get("correct").metrics["combined_score"] is True
     assert db.get_top_programs(1)[0].id == "correct"
+
+
+@pytest.mark.asyncio
+async def test_resume_before_seed_evaluation_and_new_task_run_from_scratch(
+    dsn, tmp_path, monkeypatch
+):
+    from skydiscover.optimize.config import Config, LLMModelConfig, SearchConfig
+    from skydiscover.optimize.llm import llm_pool
+    from skydiscover.optimize.llm.base import LLMResponse
+    from skydiscover.optimize.runner import Runner
+
+    async def generate(self, *args, **kwargs):
+        return LLMResponse(text="```python\ndef solution():\n    return 2\n```")
+
+    monkeypatch.setattr(llm_pool, "OpenAILLM", lambda cfg: object())
+    monkeypatch.setattr(llm_pool.LLMPool, "generate", generate)
+    cfg = Config(
+        search=SearchConfig(
+            type="topk", database=DatabaseConfig(backend="postgres", postgres_dsn=dsn)
+        ),
+        diff_based_generation=False,
+    )
+    cfg.llm.models = cfg.llm.evaluator_models = cfg.llm.guide_models = [LLMModelConfig(name="test")]
+    cfg.context_builder.system_message = "Compute the score."
+    cfg.evaluator.cascade_evaluation = False
+    seed = tmp_path / "seed.py"
+    seed.write_text("def solution():\n    return 5\n")
+    evaluator = tmp_path / "evaluate.py"
+    evaluator.write_text(
+        'import runpy\ndef evaluate(program_path):\n    return {"combined_score": runpy.run_path(program_path)["solution"]()}\n'
+    )
+    first = Runner(str(evaluator), str(seed), config=cfg, output_dir=str(tmp_path / "first"))
+    first.database.close()  # Stop before even evaluating the seed.
+    seed.unlink()
+    try:
+        resumed = Runner(
+            str(evaluator),
+            resume=first.run_id,
+            postgres_dsn=dsn,
+            output_dir=str(tmp_path / "resumed"),
+        )
+        await resumed.run(iterations=0)
+        assert resumed.initial_score == 5
+        scratch = Runner(
+            str(evaluator),
+            task_id=first.task_id,
+            postgres_dsn=dsn,
+            output_dir=str(tmp_path / "scratch"),
+        )
+        best = await scratch.run(iterations=1)
+        assert best.metrics["combined_score"] == 2
+        assert scratch.initial_score is None
+        assert scratch.initial_program_solution is None
+        with connect(dsn) as conn:
+            assert conn.execute(
+                "SELECT parent_id FROM skydiscover.attempts WHERE run_id=%s AND iteration=0",
+                (scratch.run_id,),
+            ).fetchone() == (None,)
+    finally:
+        with connect(dsn) as conn:
+            conn.execute("DELETE FROM skydiscover.runs WHERE task_id=%s", (first.task_id,))
+            conn.execute("DELETE FROM skydiscover.tasks WHERE id=%s", (first.task_id,))
+
+
+@pytest.mark.parametrize("entrypoint", ["runner", "cli", "api"])
+@pytest.mark.asyncio
+async def test_stored_runs_and_tasks_need_no_config_or_original_seed(
+    dsn, tmp_path, monkeypatch, entrypoint
+):
+    import json
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from skydiscover.optimize.api import _run_discovery_async
+    from skydiscover.optimize.llm import llm_pool
+    from skydiscover.optimize.llm.base import LLMResponse
+    from skydiscover.optimize.runner import Runner
+
+    async def generate(self, *args, **kwargs):
+        return LLMResponse(text="```python\ndef solution():\n    return 2\n```")
+
+    monkeypatch.setattr(llm_pool, "OpenAILLM", lambda cfg: object())
+    monkeypatch.setattr(llm_pool.LLMPool, "generate", generate)
+    monkeypatch.setenv("SKYDISCOVER_POSTGRES_DSN", dsn)
+    monkeypatch.setenv("OPENAI_API_KEY", "runtime-key")
+    original = tmp_path / "original"
+    original.mkdir()
+    templates = original / "templates"
+    templates.mkdir()
+    (templates / "custom.txt").write_text("task-specific template")
+    (templates / "empty").mkdir()
+    binary = templates / "helper.sh"
+    binary.write_bytes(b"#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    seed = original / "initial.py"
+    seed.write_text("def solution():\n    return 1\n")
+    evaluator = tmp_path / "external_evaluator.py"
+    evaluator.write_text(
+        'import runpy\ndef evaluate(program_path):\n    return {"combined_score": runpy.run_path(program_path)["solution"]()}\n'
+    )
+    config_path = original / "config.yaml"
+    config_path.write_text(f"""max_iterations: 1
+language: python
+diff_based_generation: false
+max_solution_length: 54321
+search:
+  type: best_of_n
+  num_context_programs: 3
+  database:
+    backend: postgres
+    best_of_n: 2
+    task_name: persisted problem
+llm:
+  api_key: original-secret
+  temperature: 0.42
+  max_tokens: 1234
+  models:
+    - name: test
+      weight: 1.0
+prompt:
+  system_message: Compute the score.
+  template_dir: {templates}
+evaluator:
+  cascade_evaluation: false
+  timeout: 17
+""")
+    first = Runner(
+        str(evaluator), str(seed), config_path=str(config_path), output_dir=str(tmp_path / "first")
+    )
+    run_id, task_id = first.run_id, first.task_id
+    new_run_id = None
+    try:
+        await first.run(iterations=1)
+        with connect(dsn) as conn:
+            task = conn.execute(
+                "SELECT description,config,assets FROM skydiscover.tasks WHERE id=%s", (task_id,)
+            ).fetchone()
+            assert task[0] == "Compute the score."
+            assert task[1]["search"]["database"]["best_of_n"] == 2
+            assert task[1]["max_solution_length"] == 54321
+            assert "original-secret" not in json.dumps(task)
+            assert all(not p.startswith("evaluator/") for p in task[2]["files"])
+        shutil.rmtree(original)
+        # The evaluator may move; it is the one explicitly external input.
+        relocated_evaluator = tmp_path / "relocated_evaluator.py"
+        evaluator.rename(relocated_evaluator)
+        new_seed = tmp_path / "new_seed.py"
+        new_seed.write_text("def solution():\n    return 7\n")
+
+        if entrypoint == "runner":
+            resumed = Runner(
+                str(relocated_evaluator), resume=run_id, output_dir=str(tmp_path / "resumed")
+            )
+            assert resumed.initial_program_solution == "def solution():\n    return 1\n"
+            assert resumed.config.search.database.best_of_n == 2
+            assert resumed.config.llm.temperature == 0.42
+            assert resumed.config.evaluator.timeout == 17
+            restored = Path(resumed.config.context_builder.template_dir)
+            assert (restored / "custom.txt").read_text() == "task-specific template"
+            assert (restored / "empty").is_dir()
+            assert (restored / "helper.sh").stat().st_mode & 0o111
+            await resumed.run(iterations=1)
+            assert resumed.initial_score == 1
+            assert not restored.exists()
+            fresh = Runner(
+                str(relocated_evaluator),
+                str(new_seed),
+                task_id=task_id,
+                output_dir=str(tmp_path / "new"),
+            )
+            new_run_id = fresh.run_id
+            assert fresh.config.context_builder.system_message == "Compute the score."
+            await fresh.run(iterations=0)
+            assert fresh.initial_score == 7
+        elif entrypoint == "api":
+            resumed = await _run_discovery_async(
+                None,
+                str(relocated_evaluator),
+                None,
+                resume=run_id,
+                output_dir=str(tmp_path / "resumed"),
+                cleanup=False,
+                iterations=1,
+            )
+            assert resumed.initial_score == 1
+            fresh = await _run_discovery_async(
+                str(new_seed),
+                str(relocated_evaluator),
+                None,
+                task_id=task_id,
+                output_dir=str(tmp_path / "new"),
+                cleanup=False,
+                iterations=0,
+            )
+            new_run_id = fresh.run_id
+            assert fresh.initial_score == 7
+            assert fresh.task_id == task_id
+        else:
+            # A fresh process has neither Python config objects nor custom client callbacks.
+            script = """
+import sys
+from skydiscover.optimize.llm import llm_pool
+from skydiscover.optimize.llm.base import LLMResponse
+from skydiscover.optimize.cli import main
+async def generate(self, *args, **kwargs):
+    return LLMResponse(text="```python\\ndef solution():\\n    return 2\\n```")
+llm_pool.OpenAILLM = lambda cfg: object()
+llm_pool.LLMPool.generate = generate
+sys.exit(main(sys.argv[1:]))
+"""
+            for arguments in [
+                [
+                    str(relocated_evaluator),
+                    "--resume",
+                    run_id,
+                    "--iterations",
+                    "1",
+                    "--output",
+                    str(tmp_path / "resumed"),
+                ],
+                [
+                    str(relocated_evaluator),
+                    "--task",
+                    task_id,
+                    "--initial-program",
+                    str(new_seed),
+                    "--iterations",
+                    "0",
+                    "--output",
+                    str(tmp_path / "new"),
+                ],
+            ]:
+                result = subprocess.run(
+                    [sys.executable, "-c", script, *arguments],
+                    capture_output=True,
+                    text=True,
+                    env=os.environ.copy(),
+                    timeout=30,
+                )
+                assert result.returncode == 0, result.stdout + result.stderr
+            new_run_id = json.loads((tmp_path / "new" / "run_id.json").read_text())["run_id"]
+        with connect(dsn) as conn:
+            assert conn.execute(
+                "SELECT task_id,starting_solution FROM skydiscover.runs WHERE id=%s", (new_run_id,)
+            ).fetchone() == (uuid.UUID(task_id), "def solution():\n    return 7\n")
+            assert (
+                conn.execute(
+                    "SELECT next_iteration FROM skydiscover.runs WHERE id=%s", (run_id,)
+                ).fetchone()[0]
+                == 3
+            )
+    finally:
+        first.database.close()
+        with connect(dsn) as conn:
+            conn.execute("DELETE FROM skydiscover.runs WHERE task_id=%s", (task_id,))
+            conn.execute("DELETE FROM skydiscover.tasks WHERE id=%s", (task_id,))

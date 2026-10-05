@@ -4,8 +4,9 @@ description: Durable native Optimize runs without file checkpoints.
 ---
 
 Optimize defaults to an in-memory program database. Select PostgreSQL to retain
-candidates, metrics, lineage, prompts, artifacts, RNG state, and search state in
-one database. The backend supports Top-K, Best-of-N, beam search, AdaEvolve,
+task descriptions, complete configurations, starting solutions, custom prompt
+templates, candidates, metrics, lineage, prompts, artifacts, RNG state, and search
+state in one database. Evaluators remain external. The backend supports Top-K, Best-of-N, beam search, AdaEvolve,
 OpenEvolve Native, GEPA Native, Claude Code, and EvoX (including its meta search).
 Synthesize and third-party search engines are unchanged.
 
@@ -39,8 +40,9 @@ search:
 ```
 
 `postgres_dsn` can also be set under `search.database`. An omitted DSN uses
-`SKYDISCOVER_POSTGRES_DSN`. The connection string is excluded from stored run
-configuration. Memory remains the default when `backend` is omitted.
+`SKYDISCOVER_POSTGRES_DSN`. Database credentials and model API keys are resolved
+at runtime and excluded from configuration snapshots. Memory remains the
+default when `backend` is omitted.
 
 Run the text similarity example with your edited configuration:
 
@@ -51,16 +53,67 @@ uv run skydiscover optimize \
   --config skydiscover/optimize/examples/text_similarity/config.yaml
 ```
 
-The runner prints a run ID and saves it to `run_id.json` in the output directory.
-Resume with the same evaluator and search configuration:
+Each run references a task. A new run creates a task unless
+`search.database.task_id` specifies an existing task UUID. Set the optional
+`task_name` when creating a task:
+
+```yaml
+search:
+  type: best_of_n
+  database:
+    backend: postgres
+    task_name: text_similarity
+```
+
+The runner logs task and run IDs and saves both to `run_id.json` in the output
+directory. To start another run for the same task, set its task ID in the config:
+
+```yaml
+search:
+  type: best_of_n
+  database:
+    backend: postgres
+    task_id: YOUR_TASK_UUID
+```
+
+Task names are labels; matching names do not automatically group runs. Runs
+sharing a task may use different search configurations and starting solutions.
+Candidates, initial solutions, selections, and progress belong to individual
+runs. Tasks store their description and default configuration, without a
+starting solution. PostgreSQL enforces each run's task reference with a foreign
+key. `runs.config` stores the full resolved run configuration;
+`runs.database_config` stores the search policy settings.
+
+Resume using only the run ID and an evaluator path. No configuration or seed
+file is needed:
 
 ```bash
 uv run skydiscover optimize \
-  skydiscover/optimize/examples/text_similarity/initial_program.py \
   skydiscover/optimize/examples/text_similarity/evaluator/ \
-  --config skydiscover/optimize/examples/text_similarity/config.yaml \
   --resume RUN_ID
 ```
+
+Start a new run from a stored task, optionally using a different starting
+solution:
+
+```bash
+uv run skydiscover optimize \
+  skydiscover/optimize/examples/text_similarity/evaluator/ \
+  --task TASK_ID \
+  --initial-program another_solution.py
+```
+
+Omitting `--initial-program` starts from scratch. The run inherits the task's
+stored model, prompt, evaluator settings, and search configuration. Explicit
+model or search overrides can select a different experiment. An evaluator path
+may be omitted when the stored external location is still available.
+`--postgres-dsn` can supply the connection string instead of the environment.
+
+Custom templates, codebase inputs, and generated strategy inputs are stored as
+file assets and materialized into a temporary workspace. Resume restores the
+run's original starting solution and its committed search state; it does not
+read the original config, seed, or template files. The external evaluator and
+its own dependencies must be available separately.
 
 `--iterations` specifies how many additional iterations to run. The database
 remembers completed iterations, including failures and rejections, and does not
@@ -80,7 +133,7 @@ its database connection closes. Internal parallel iterations use this same
 connection and short transactions. Different runs may execute concurrently.
 
 All PostgreSQL algorithm subclasses share the same schema. Search state is
-versioned JSONB, and candidate records are shared across EvoX strategy revisions.
+JSONB, and candidate records are shared across EvoX strategy revisions.
 Population eviction retains candidate history. The PostgreSQL backend uses SQL
 for candidate lookup and ranking. Native algorithms reuse their existing
 selection calculations over SQL-backed population views. Runtime archive state
@@ -92,8 +145,20 @@ Claude Code resumes by starting a new CLI session from the stored best solution;
 saved snapshots retain the acknowledged turn count. Its live CLI session is not
 a database record.
 
-The Python API accepts `resume=RUN_ID`, and `DiscoveryResult.run_id` identifies
-the durable run. A directly constructed database holds its lock until `close()`.
+The Python API accepts `resume=RUN_ID` or `task_id=TASK_ID` without a config:
+
+```python
+from skydiscover import run_discovery
+
+continued = run_discovery(evaluator="evaluate.py", resume=RUN_ID)
+fresh = run_discovery(
+    evaluator="evaluate.py", task_id=TASK_ID, initial_program="another_solution.py"
+)
+```
+
+`DiscoveryResult.run_id` and `DiscoveryResult.task_id` identify the durable run
+and its task. Resume recovers the stored task ID; an explicitly conflicting task
+ID is rejected. A directly constructed database holds its lock until `close()`.
 
 Replay a durable run in the monitor without acquiring its writer lock:
 

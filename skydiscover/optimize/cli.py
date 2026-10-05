@@ -74,7 +74,17 @@ def parse_args(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> 
         default=None,
         help="Path to a checkpoint directory to resume from",
     )
-    parser.add_argument("--resume", help="Resume a PostgreSQL run by its run ID")
+    stored = parser.add_mutually_exclusive_group()
+    stored.add_argument("--resume", help="Resume a PostgreSQL run by its run ID")
+    stored.add_argument("--task", help="Start a new PostgreSQL run from a stored task ID")
+    parser.add_argument(
+        "--postgres-dsn", help="PostgreSQL connection string (defaults to SKYDISCOVER_POSTGRES_DSN)"
+    )
+    parser.add_argument(
+        "--initial-program",
+        dest="initial_program_override",
+        help="Starting solution for a new task run",
+    )
     parser.add_argument("--api-base", default=None, help="Base URL for the LLM API")
     parser.add_argument(
         "--agentic",
@@ -110,6 +120,11 @@ def parse_args(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> 
     else:
         parser.error("Expected either '<evaluation_file>' or '<initial_program> <evaluation_file>'")
 
+    if args.initial_program_override:
+        if args.initial_program:
+            parser.error("Specify the initial program once")
+        args.initial_program = args.initial_program_override
+
     delattr(args, "paths")
     return args
 
@@ -136,8 +151,22 @@ async def main_async(argv: Optional[List[str]] = None, prog: Optional[str] = Non
     evaluator_env_vars: Optional[dict[str, str]] = None
 
     # Load the configuration
-    if args.config or has_overrides:
-        config = load_config(args.config)
+    if args.config or has_overrides or args.resume or args.task:
+        if not args.config and (args.resume or args.task):
+            from skydiscover.optimize.search.persistence.inputs import (
+                read_inputs,
+                restore_configuration,
+            )
+
+            dsn = args.postgres_dsn or os.environ.get("SKYDISCOVER_POSTGRES_DSN")
+            try:
+                payload = read_inputs(dsn, run_id=args.resume, task_id=args.task)
+                config = restore_configuration(payload, dsn)
+            except Exception as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        else:
+            config = load_config(args.config)
 
         evaluator_env_vars = None
 
@@ -154,7 +183,12 @@ async def main_async(argv: Optional[List[str]] = None, prog: Optional[str] = Non
             return 1
 
         # Resolve benchmark problem if configured and no initial_program provided
-        if args.initial_program is None and config.benchmark and config.benchmark.enabled:
+        if (
+            not (args.resume or args.task)
+            and args.initial_program is None
+            and config.benchmark
+            and config.benchmark.enabled
+        ):
             try:
                 resolution = resolve_benchmark_problem(config.benchmark)
                 args.initial_program = resolution.initial_program_path
@@ -185,14 +219,15 @@ async def main_async(argv: Optional[List[str]] = None, prog: Optional[str] = Non
             print(f"Using search algorithm: {args.search}")
 
     # Evaluator must be resolved by now (positional, or filled by a benchmark resolver).
-    if args.evaluation_file is None:
+    stored_inputs = args.resume or args.task or (config and config.search.database.task_id)
+    if args.evaluation_file is None and not stored_inputs:
         print(
             "Error: no evaluator. Pass an evaluation_file positional, or a -c config "
             "whose benchmark resolves one.",
             file=sys.stderr,
         )
         return 1
-    if not os.path.exists(args.evaluation_file):
+    if args.evaluation_file is not None and not os.path.exists(args.evaluation_file):
         print(f"Error: Evaluation file '{args.evaluation_file}' not found", file=sys.stderr)
         return 1
 
@@ -278,6 +313,8 @@ async def main_async(argv: Optional[List[str]] = None, prog: Optional[str] = Non
             output_dir=args.output,
             evaluator_env_vars=evaluator_env_vars,
             resume=args.resume,
+            task_id=args.task,
+            postgres_dsn=args.postgres_dsn,
         )
 
         # Load the checkpoint if provided
@@ -306,6 +343,7 @@ async def main_async(argv: Optional[List[str]] = None, prog: Optional[str] = Non
                 print(f"  {name}: {formatted}")
 
         if runner.run_id:
+            print(f"\nTask ID: {runner.task_id}")
             print(f"\nRun ID: {runner.run_id}")
             print(f"To resume: --resume {runner.run_id}")
         if latest_checkpoint and not runner.run_id:

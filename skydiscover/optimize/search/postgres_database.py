@@ -15,7 +15,7 @@ from dataclasses import asdict
 
 from skydiscover.optimize.search.base_database import Program, ProgramDatabase
 from skydiscover.optimize.search.persistence.operations import database_operation
-from skydiscover.optimize.search.persistence.schema import SCHEMA_VERSION, connect
+from skydiscover.optimize.search.persistence.schema import connect
 from skydiscover.optimize.search.persistence.state import decode, encode, json_data, restore_data
 from skydiscover.optimize.utils.metrics import get_score
 
@@ -77,6 +77,7 @@ class PostgresProgramDatabase(ProgramDatabase):
         "name",
         "config",
         "run_id",
+        "task_id",
         "programs",
         "prompts_by_program",
         "checkpoint_manager",
@@ -97,6 +98,7 @@ class PostgresProgramDatabase(ProgramDatabase):
         self._conn = getattr(config, "_postgres_connection", None)
         self._owns_connection = self._conn is None
         self.run_id = str(uuid.UUID(config.run_id)) if config.run_id else str(uuid.uuid4())
+        self.task_id = str(uuid.UUID(config.task_id)) if config.task_id else None
         self._revision = getattr(config, "_strategy_revision", 0)
         self.rng = random.Random(config.random_seed)
         self.programs = _Programs(self)
@@ -121,18 +123,11 @@ class PostgresProgramDatabase(ProgramDatabase):
                 )
             self._conn = connect(self.config.postgres_dsn)
         try:
-            exists = self._conn.execute(
-                "SELECT to_regclass('skydiscover.schema_version')"
-            ).fetchone()[0]
-            if not exists:
-                raise ValueError("PostgreSQL schema is missing; run skydiscover db migrate first")
-            version = self._conn.execute(
-                "SELECT version FROM skydiscover.schema_version"
+            tables = self._conn.execute(
+                "SELECT to_regclass('skydiscover.tasks'), to_regclass('skydiscover.runs')"
             ).fetchone()
-            if not version or version[0] != SCHEMA_VERSION:
-                raise ValueError(
-                    "Unsupported PostgreSQL schema version; migrate the database first"
-                )
+            if not all(tables):
+                raise ValueError("PostgreSQL schema is missing; run skydiscover db migrate first")
             if self._owns_connection:
                 locked = self._conn.execute(
                     "SELECT pg_try_advisory_lock(hashtextextended(%s,0))", (self.run_id,)
@@ -141,32 +136,52 @@ class PostgresProgramDatabase(ProgramDatabase):
                     raise RuntimeError(f"Run {self.run_id} is already open in another process")
             with self._conn.transaction():
                 row = self._conn.execute(
-                    "SELECT search_type,config,active_revision FROM skydiscover.runs WHERE id=%s",
+                    "SELECT search_type,database_config,active_revision,task_id FROM skydiscover.runs WHERE id=%s",
                     (self.run_id,),
                 ).fetchone()
                 cfg = asdict(self.config)
                 # Connection secrets and resume IDs are not durable configuration.
                 cfg.pop("postgres_dsn", None)
                 cfg.pop("run_id", None)
+                cfg.pop("task_id", None)
+                cfg.pop("task_name", None)
+                # Input locations are materialized afresh and are not policy settings.
+                for key in ("database_file_path", "evaluation_file", "config_path", "db_path"):
+                    cfg.pop(key, None)
                 if row is None:
                     if self.config.run_id and self._owns_connection:
                         raise ValueError(f"Unknown run ID {self.run_id}")
+                    if self.task_id:
+                        if not self._conn.execute(
+                            "SELECT id FROM skydiscover.tasks WHERE id=%s", (self.task_id,)
+                        ).fetchone():
+                            raise ValueError(f"Unknown task ID {self.task_id}")
+                    else:
+                        self.task_id = str(uuid.uuid4())
+                        self._conn.execute(
+                            "INSERT INTO skydiscover.tasks(id,name) VALUES (%s,%s)",
+                            (self.task_id, self.config.task_name),
+                        )
                     self._conn.execute(
-                        "INSERT INTO skydiscover.runs(id,search_type,config) VALUES (%s,%s,%s::jsonb)",
-                        (self.run_id, self.name, json.dumps(cfg)),
+                        "INSERT INTO skydiscover.runs(id,task_id,search_type,database_config) VALUES (%s,%s,%s,%s::jsonb)",
+                        (self.run_id, self.task_id, self.name, json.dumps(cfg)),
                     )
                     self._conn.execute(
                         "INSERT INTO skydiscover.strategies(run_id,revision) VALUES (%s,0)",
                         (self.run_id,),
                     )
-                elif self._owns_connection:
-                    if row[0] != self.name:
-                        raise ValueError(f"Run uses {row[0]}, not {self.name}")
-                    if row[1] != cfg:
-                        raise ValueError(
-                            "Search database configuration differs from the stored run"
-                        )
-                    self._revision = row[2]
+                else:
+                    if self.task_id and self.task_id != str(row[3]):
+                        raise ValueError("Task ID differs from the stored run")
+                    self.task_id = str(row[3])
+                    if self._owns_connection:
+                        if row[0] != self.name:
+                            raise ValueError(f"Run uses {row[0]}, not {self.name}")
+                        if row[1] != cfg:
+                            raise ValueError(
+                                "Search database configuration differs from the stored run"
+                            )
+                        self._revision = row[2]
                 self._ready = True
                 with self.operation():
                     pass
@@ -414,6 +429,30 @@ class PostgresProgramDatabase(ProgramDatabase):
         )
 
     @database_operation
+    def store_inputs(self, config, assets, starting_solution, starting_filename):
+        self._conn.execute(
+            "UPDATE skydiscover.runs SET config=%s::jsonb,assets=%s::jsonb,"
+            "starting_solution=%s,starting_filename=%s WHERE id=%s",
+            (
+                json.dumps(config),
+                json.dumps(assets),
+                starting_solution,
+                starting_filename,
+                self.run_id,
+            ),
+        )
+        self._conn.execute(
+            "UPDATE skydiscover.tasks SET description=%s,config=%s::jsonb,assets=%s::jsonb "
+            "WHERE id=%s AND config='{}'::jsonb",
+            (
+                config["prompt"]["system_message"],
+                json.dumps(config),
+                json.dumps(assets),
+                self.task_id,
+            ),
+        )
+
+    @database_operation
     def set_strategy_source(self, source):
         self._conn.execute(
             "UPDATE skydiscover.strategies SET source=%s WHERE run_id=%s AND revision=%s",
@@ -430,6 +469,7 @@ class PostgresProgramDatabase(ProgramDatabase):
     def strategy_config(self, revision=None):
         config = copy.copy(self.config)
         config.run_id = self.run_id
+        config.task_id = self.task_id
         config._postgres_connection = self._conn
         config._strategy_revision = (
             revision

@@ -1,18 +1,24 @@
 """The only PostgreSQL schema definition. Algorithm subclasses do not own DDL."""
 
-SCHEMA_VERSION = 1
 DDL = """
 CREATE SCHEMA IF NOT EXISTS skydiscover;
-CREATE TABLE IF NOT EXISTS skydiscover.schema_version (
-    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), version integer NOT NULL
+CREATE TABLE IF NOT EXISTS skydiscover.tasks (
+    id uuid PRIMARY KEY, name text,
+    description text NOT NULL DEFAULT '',
+    config jsonb NOT NULL DEFAULT '{}', assets jsonb NOT NULL DEFAULT '{}',
+    created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS skydiscover.runs (
-    id uuid PRIMARY KEY, search_type text NOT NULL, config jsonb NOT NULL,
+    id uuid PRIMARY KEY, task_id uuid NOT NULL REFERENCES skydiscover.tasks(id),
+    search_type text NOT NULL, database_config jsonb NOT NULL,
+    config jsonb NOT NULL DEFAULT '{}', assets jsonb NOT NULL DEFAULT '{}',
+    starting_solution text, starting_filename text,
     next_iteration integer NOT NULL DEFAULT 0,
     active_revision integer NOT NULL DEFAULT 0,
     controller_state jsonb NOT NULL DEFAULT '{}',
     created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS runs_task ON skydiscover.runs(task_id);
 CREATE TABLE IF NOT EXISTS skydiscover.strategies (
     run_id uuid NOT NULL REFERENCES skydiscover.runs(id) ON DELETE CASCADE,
     revision integer NOT NULL, source text, state jsonb NOT NULL DEFAULT '{}',
@@ -62,17 +68,7 @@ def migrate(dsn):
     with connect(dsn) as conn, conn.transaction():
         # Serialize concurrent migrations, independently of run locks.
         conn.execute("SELECT pg_advisory_xact_lock(781004100)")
-        conn.execute("CREATE SCHEMA IF NOT EXISTS skydiscover")
-        exists = conn.execute("SELECT to_regclass('skydiscover.schema_version')").fetchone()[0]
-        if exists:
-            row = conn.execute("SELECT version FROM skydiscover.schema_version").fetchone()
-            if row and row[0] != SCHEMA_VERSION:
-                raise ValueError(f"Unsupported database schema version {row[0]}")
         conn.execute(DDL)
-        conn.execute(
-            "INSERT INTO skydiscover.schema_version VALUES (true, %s) ON CONFLICT DO NOTHING",
-            (SCHEMA_VERSION,),
-        )
 
 
 def main(argv=None, prog=None):
@@ -86,5 +82,5 @@ def main(argv=None, prog=None):
     if not args.dsn:
         parser.error("set SKYDISCOVER_POSTGRES_DSN or pass --dsn")
     migrate(args.dsn)
-    print(f"PostgreSQL schema is at version {SCHEMA_VERSION}")
+    print("PostgreSQL schema created")
     return 0
